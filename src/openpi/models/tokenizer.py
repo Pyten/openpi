@@ -1,5 +1,6 @@
 import logging
 import os
+import pathlib
 
 import jax
 import numpy as np
@@ -15,7 +16,18 @@ class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
         self._max_len = max_len
 
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        # Prefer local paths to avoid remote download if available.
+        local_override = os.getenv("PALIGEMMA_TOKENIZER_PATH")
+        candidate_paths: list[pathlib.Path] = []
+        if local_override:
+            candidate_paths.append(pathlib.Path(local_override).expanduser())
+        # Common local default path (user provided)
+# Common cache path created by previous downloads
+        candidate_paths.append(pathlib.Path.home() / ".cache" / "openpi" / "big_vision" / "paligemma_tokenizer.model")
+
+        path = next((p for p in candidate_paths if p.exists()), None)
+        if path is None:
+            path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -53,7 +65,11 @@ class FASTTokenizer:
         self._max_len = max_len
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        local_override = os.getenv("PALIGEMMA_TOKENIZER_PATH")
+        if local_override and pathlib.Path(local_override).expanduser().exists():
+            path = pathlib.Path(local_override).expanduser()
+        else:
+            path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -155,7 +171,11 @@ class BinningTokenizer:
         self._n_bins = n_bins
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        local_override = os.getenv("PALIGEMMA_TOKENIZER_PATH")
+        if local_override and pathlib.Path(local_override).expanduser().exists():
+            path = pathlib.Path(local_override).expanduser()
+        else:
+            path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -291,7 +311,11 @@ class FSQTokenizer:
         )
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        local_override = os.getenv("PALIGEMMA_TOKENIZER_PATH")
+        if local_override and pathlib.Path(local_override).expanduser().exists():
+            path = pathlib.Path(local_override).expanduser()
+        else:
+            path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 

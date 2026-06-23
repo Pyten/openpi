@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import io
 import logging
 import multiprocessing
 import os
@@ -10,6 +11,8 @@ import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
+from PIL import Image as PILImage
+from torchvision import transforms
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -17,6 +20,38 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+
+
+def _image_to_tensor(image) -> torch.Tensor:
+    """Convert a PIL image or HF embedded-image dict to a CHW float tensor."""
+    if isinstance(image, dict):
+        if image.get("bytes"):
+            image = PILImage.open(io.BytesIO(image["bytes"]))
+        elif image.get("path"):
+            image = PILImage.open(image["path"])
+        else:
+            raise ValueError(f"Unsupported image dict keys: {list(image)}")
+    return transforms.ToTensor()(image)
+
+
+def hf_transform_to_torch(items_dict: dict):
+    """Convert HF dataset batch items to torch tensors.
+
+    Extends the LeRobot transform to support parquet image columns stored as
+    embedded dicts with `bytes`/`path` keys.
+    """
+    for key in items_dict:
+        first_item = items_dict[key][0]
+        if isinstance(first_item, PILImage.Image):
+            to_tensor = transforms.ToTensor()
+            items_dict[key] = [to_tensor(img) for img in items_dict[key]]
+        elif isinstance(first_item, dict) and ("bytes" in first_item or "path" in first_item):
+            items_dict[key] = [_image_to_tensor(img) for img in items_dict[key]]
+        elif first_item is None:
+            pass
+        else:
+            items_dict[key] = [x if isinstance(x, str) else torch.tensor(x) for x in items_dict[key]]
+    return items_dict
 
 
 class Dataset(Protocol[T_co]):
@@ -96,6 +131,41 @@ class IterableTransformedDataset(IterableDataset[T_co]):
         return len(self._dataset)
 
 
+class TorchColumnDatasetProxy:
+    """Make Hugging Face Dataset column access compatible with LeRobot's torch.stack calls."""
+
+    def __init__(self, dataset):
+        self._dataset = dataset
+
+    def __getitem__(self, key):
+        value = self._dataset[key]
+        if isinstance(key, str):
+            return tuple(value)
+        return value
+
+    def __getattr__(self, name):
+        try:
+            dataset = object.__getattribute__(self, "_dataset")
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+        return getattr(dataset, name)
+
+    def __getstate__(self):
+        return {"_dataset": self._dataset}
+
+    def __setstate__(self, state):
+        self._dataset = state["_dataset"]
+
+    def __len__(self):
+        return len(self._dataset)
+
+    def __iter__(self):
+        return iter(self._dataset)
+
+    def select(self, *args, **kwargs):
+        return TorchColumnDatasetProxy(self._dataset.select(*args, **kwargs))
+
+
 class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples
@@ -137,13 +207,90 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+    # Detect absolute filesystem path to use as root instead of repo_id,
+    # avoiding HuggingFace API validation which rejects absolute paths.
+    if os.path.isabs(repo_id):
+        local_root = repo_id
+        repo_id_for_hf = "local"
+    else:
+        local_root = None
+        repo_id_for_hf = repo_id
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id_for_hf, root=local_root)
+
+    # If the videos directory does not exist, patch LeRobotDatasetMetadata so
+    # that video_keys is empty. This prevents get_episodes_file_paths() from
+    # including non-existent video files in its check, avoiding the AssertionError
+    # that would otherwise trigger an offline download fallback.
+    _needs_video_patch = (
+        local_root is not None
+        and not os.path.isdir(os.path.join(local_root, "videos"))
     )
+    if _needs_video_patch:
+        _orig_video_keys = lerobot_dataset.LeRobotDatasetMetadata.video_keys.fget
+        lerobot_dataset.LeRobotDatasetMetadata.video_keys = property(lambda self: [])
+
+    # If task_index in parquet data exceeds available tasks, patch __getitem__ to
+    # skip the task lookup. The raw task_index value is still returned.
+    _needs_task_patch = False
+    if local_root is not None and len(dataset_meta.tasks) > 0:
+        try:
+            import glob
+            first_parquet = glob.glob(os.path.join(local_root, "data", "*", "episode_*.parquet"))
+            if first_parquet:
+                import pandas as pd
+                df = pd.read_parquet(first_parquet[0])
+                if "task_index" in df.columns and df["task_index"].max() >= len(dataset_meta.tasks):
+                    _needs_task_patch = True
+        except Exception:
+            pass
+
+    _orig_getitem = lerobot_dataset.LeRobotDataset.__getitem__
+    if _needs_task_patch:
+        def _patched_getitem(self, idx):
+            item = _orig_getitem(self, idx)
+            task_idx = item.get("task_index", -1)
+            if task_idx >= len(self.meta.tasks):
+                item["task"] = f"task_{task_idx}"
+            return item
+        lerobot_dataset.LeRobotDataset.__getitem__ = _patched_getitem
+
+    _orig_load_hf_dataset = lerobot_dataset.LeRobotDataset.load_hf_dataset
+
+    def _patched_load_hf_dataset(self):
+        columns = list(self.meta.features)
+        if self.episodes is None:
+            path = str(self.root / "data")
+            hf_dataset = lerobot_dataset.load_dataset("parquet", data_dir=path, split="train", columns=columns)
+        else:
+            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
+            hf_dataset = lerobot_dataset.load_dataset("parquet", data_files=files, split="train", columns=columns)
+
+        hf_dataset.set_format(
+            type="torch",
+            columns=["timestamp", "episode_index"],
+            output_all_columns=True,
+        )
+
+        return TorchColumnDatasetProxy(hf_dataset)
+
+    lerobot_dataset.LeRobotDataset.load_hf_dataset = _patched_load_hf_dataset
+    try:
+        dataset = lerobot_dataset.LeRobotDataset(
+            repo_id_for_hf,
+            root=local_root,
+            download_videos=False,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            },
+        )
+        dataset.hf_dataset.set_transform(hf_transform_to_torch)
+    finally:
+        lerobot_dataset.LeRobotDataset.load_hf_dataset = _orig_load_hf_dataset
+        if _needs_video_patch:
+            lerobot_dataset.LeRobotDatasetMetadata.video_keys = property(_orig_video_keys)
+        if _needs_task_patch:
+            lerobot_dataset.LeRobotDataset.__getitem__ = _orig_getitem
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -165,7 +312,7 @@ def create_rlds_dataset(
         shuffle=shuffle,
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
-        datasets=data_config.datasets,
+        filter_dict_path=data_config.filter_dict_path,
     )
 
 
