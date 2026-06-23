@@ -20,10 +20,11 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.grab_32_policy as grab_32_policy
+import openpi.policies.robot_32_policy as robot_32_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
@@ -94,8 +95,8 @@ class DataConfig:
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
-    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # Path to the data filter file for DROID dataset
+    filter_dict_path: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -367,16 +368,8 @@ class RLDSDroidDataConfig(DataConfigFactory):
     # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
     # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
     # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
-
-    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
-        droid_rlds_dataset.RLDSDataset(
-            name="droid",
-            version="1.0.1",
-            weight=1.0,
-            filter_dict_path="gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json",
-        ),
-    )
+    # Path to the filter dictionary file.
+    filter_dict_path: str | None = "gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -419,7 +412,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
-            datasets=self.datasets,
+            filter_dict_path=self.filter_dict_path,
         )
 
 
@@ -459,6 +452,376 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotGrab32DataConfig(DataConfigFactory):
+    """
+    32维机器人数据集配置（grab_lerobot_1&2数据集）
+    32维状态/动作：头2 + 左臂7 + 左手6 + 右臂7 + 右手6 + 腰2 + 腿2
+    只有head camera图像
+    
+    关节顺序:
+    头部 (0-1): head_pitch, head_yaw
+    左臂 (2-8): left_shoulder_pitch, left_shoulder_roll, left_shoulder_yaw, left_elbow_pitch, left_wrist_yaw, left_wrist_pitch, left_wrist_roll
+    左手 (9-14): left_little_finger, left_ring_finger, left_middle_finger, left_fore_finger, left_thumb_bend, left_thumb_rotation
+    右臂 (15-21): right_shoulder_pitch, right_shoulder_roll, right_shoulder_yaw, right_elbow_pitch, right_wrist_yaw, right_wrist_pitch, right_wrist_roll
+    右手 (22-27): right_little_finger, right_ring_finger, right_middle_finger, right_fore_finger, right_thumb_bend, right_thumb_rotation
+    腰部 (28-29): waist_yaw, waist_pitch
+    腿部 (30-31): hip_pitch, knee_pitch
+    """
+    
+    # 默认提示词
+    default_prompt: str = "pick up the box"
+    
+    # 是否对关节动作使用 delta 转换（手指保持 absolute）
+    use_delta_joint_actions: bool = True
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack转换：将LeRobot数据集的key映射到模型期望的key
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # 图像映射（只有head camera）
+                        "images": {"cam_high": "observation.images.cam_high"},
+                        # 状态和动作映射
+                        "state": "observation.state",
+                        "actions": "action",
+                        # 提示词
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        
+        # 数据转换
+        data_transforms = _transforms.Group(
+            inputs=[grab_32_policy.Grab32Inputs(model_type=model_config.model_type)],
+            outputs=[grab_32_policy.Grab32Outputs()],
+        )
+        
+        # 添加 delta actions 转换（与 LeRobot32DataConfig 相同）
+        if self.use_delta_joint_actions:
+            # Delta action mask: 关节用delta，手指用absolute
+            delta_action_mask = _transforms.make_bool_mask(2, 7, -6, 7, -6, 2, 2)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        
+        # 模型转换
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=True,  # 从数据集的task字段读取提示词
+            action_sequence_keys=("action",),  # 指定action key（单数）
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobot32DataConfig(DataConfigFactory):
+    """
+    通用32维机器人数据集配置
+    32维状态/动作：头2 + 左臂7 + 左手6 + 右臂7 + 右手6 + 腰2 + 腿2
+    只有head camera图像
+    
+    适用于所有32维机器人任务（grab、turn等）
+    
+    关节顺序:
+    头部 (0-1): head_pitch, head_yaw
+    左臂 (2-8): left_shoulder_pitch, left_shoulder_roll, left_shoulder_yaw, left_elbow_pitch, left_wrist_yaw, left_wrist_pitch, left_wrist_roll
+    左手 (9-14): left_little_finger, left_ring_finger, left_middle_finger, left_fore_finger, left_thumb_bend, left_thumb_rotation
+    右臂 (15-21): right_shoulder_pitch, right_shoulder_roll, right_shoulder_yaw, right_elbow_pitch, right_wrist_yaw, right_wrist_pitch, right_wrist_roll
+    右手 (22-27): right_little_finger, right_ring_finger, right_middle_finger, right_fore_finger, right_thumb_bend, right_thumb_rotation
+    腰部 (28-29): waist_yaw, waist_pitch
+    腿部 (30-31): hip_pitch, knee_pitch
+    """
+    
+    # 默认提示词（可通过参数覆盖）
+    default_prompt: str = "robot task"
+    
+    # 是否对关节动作使用 delta 转换（手指保持 absolute）
+    # Pi0 模型在 delta actions 上训练，所以需要将绝对位置转换为相对增量
+    use_delta_joint_actions: bool = True
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack转换：将LeRobot数据集的key映射到模型期望的key
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # 图像映射（只有head camera）
+                        "images": {"cam_high": "observation.images.cam_high"},
+                        # 状态和动作映射
+                        "state": "observation.state",
+                        "actions": "action",
+                        # 提示词
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        
+        # 数据转换（使用通用的32维policy）
+        data_transforms = _transforms.Group(
+            inputs=[robot_32_policy.Robot32Inputs(model_type=model_config.model_type)],
+            outputs=[robot_32_policy.Robot32Outputs()],
+        )
+        
+        # 添加 delta actions 转换
+        # 数据集中的 action 是绝对位置 (action[t] = state[t+1])
+        # Pi0 模型需要相对增量，所以需要转换
+        if self.use_delta_joint_actions:
+            # Delta action mask (True=delta, False=absolute):
+            # 头部2: delta (关节)
+            # 左臂7: delta (关节)
+            # 左手6: absolute (灵巧手手指，类似夹爪)
+            # 右臂7: delta (关节)
+            # 右手6: absolute (灵巧手手指，类似夹爪)
+            # 腰部2: delta (关节)
+            # 腿部2: delta (关节)
+            delta_action_mask = _transforms.make_bool_mask(2, 7, -6, 7, -6, 2, 2)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        
+        # 模型转换
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=True,  # 从数据集的task字段读取提示词
+            action_sequence_keys=("action",),  # 指定action key（单数）
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobot32WristDataConfig(DataConfigFactory):
+    """
+    通用32维机器人数据集配置（带腕部相机版本）
+    32维状态/动作：头2 + 左臂7 + 左手6 + 右臂7 + 右手6 + 腰2 + 腿2
+    3个相机：head camera + left wrist + right wrist
+    
+    适用于所有带腕部相机的32维机器人任务
+    
+    关节顺序:
+    头部 (0-1): head_pitch, head_yaw
+    左臂 (2-8): left_shoulder_pitch, left_shoulder_roll, left_shoulder_yaw, left_elbow_pitch, left_wrist_yaw, left_wrist_pitch, left_wrist_roll
+    左手 (9-14): left_little_finger, left_ring_finger, left_middle_finger, left_fore_finger, left_thumb_bend, left_thumb_rotation
+    右臂 (15-21): right_shoulder_pitch, right_shoulder_roll, right_shoulder_yaw, right_elbow_pitch, right_wrist_yaw, right_wrist_pitch, right_wrist_roll
+    右手 (22-27): right_little_finger, right_ring_finger, right_middle_finger, right_fore_finger, right_thumb_bend, right_thumb_rotation
+    腰部 (28-29): waist_yaw, waist_pitch
+    腿部 (30-31): hip_pitch, knee_pitch
+    """
+    
+    # 默认提示词（可通过参数覆盖）
+    default_prompt: str = "robot task"
+    
+    # 是否对关节动作使用 delta 转换（手指保持 absolute）
+    # Pi0 模型在 delta actions 上训练，所以需要将绝对位置转换为相对增量
+    use_delta_joint_actions: bool = True
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack转换：将LeRobot数据集的key映射到模型期望的key（包含三个相机）
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        # 三个相机映射
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        # 状态和动作映射
+                        "state": "observation.state",
+                        "actions": "action",
+                        # 提示词
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        
+        # 数据转换（使用带腕部相机的32维policy）
+        data_transforms = _transforms.Group(
+            inputs=[robot_32_policy.Robot32WristInputs(model_type=model_config.model_type)],
+            outputs=[robot_32_policy.Robot32WristOutputs()],
+        )
+        
+        # 添加 delta actions 转换
+        # 数据集中的 action 是绝对位置 (action[t] = state[t+1])
+        # Pi0 模型需要相对增量，所以需要转换
+        if self.use_delta_joint_actions:
+            # Delta action mask (True=delta, False=absolute):
+            # 头部2: delta (关节)
+            # 左臂7: delta (关节)
+            # 左手6: absolute (灵巧手手指，类似夹爪)
+            # 右臂7: delta (关节)
+            # 右手6: absolute (灵巧手手指，类似夹爪)
+            # 腰部2: delta (关节)
+            # 腿部2: delta (关节)
+            delta_action_mask = _transforms.make_bool_mask(2, 7, -6, 7, -6, 2, 2)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        
+        # 模型转换
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=True,  # 从数据集的task字段读取提示词
+            action_sequence_keys=("action",),  # 指定action key（单数）
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class EgoCameraDataConfigFactory(DataConfigFactory):
+    """只使用 egocentric 相机的32维机器人数据集配置。
+
+    动作空间为末端执行器位姿（最后14维：左臂7 + 右臂7）。
+    适用于只有一个 ego 相机的数据集。
+    """
+
+    default_prompt: str = "robot task"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "egocentric": "observation.images.egocentric",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[robot_32_policy.Robot32EgoInputs(model_type=model_config.model_type)],
+            outputs=[robot_32_policy.Robot32EgoOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=True,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class EgoCameraData(DataConfigFactory):
+    """只使用 cam_high 相机的14维末端执行器数据集配置（用于 robot_ego_base）。
+
+    动作空间为末端执行器位姿（最后14维：左臂7 + 右臂7）。
+    数据集图像 key 为 cam_high（非 egocentric）。
+    """
+
+    default_prompt: str = "robot task"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[robot_32_policy.Robot32WristInputs(model_type=model_config.model_type)],
+            outputs=[robot_32_policy.Robot32WristOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=True,
+            action_sequence_keys=("action",),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotArm14EeposeActionDataConfig(DataConfigFactory):
+    """双臂14维关节 state + 14维 eepose action 的腕部相机数据配置。"""
+
+    default_prompt: str = "pick up the box"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[robot_32_policy.RobotArm14WristInputs(model_type=model_config.model_type)],
+            outputs=[robot_32_policy.RobotArm14WristOutputs()],
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            prompt_from_task=True,
+            action_sequence_keys=("action",),
         )
 
 
@@ -532,7 +895,7 @@ class TrainConfig:
     # device memory will be reduced but training could potentially be slower.
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
-    fsdp_devices: int = 1
+    fsdp_devices: int = 2
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -930,6 +1293,195 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
+    
+    #
+    # 32维机器人微调配置（合并两批数据）
+    #
+    TrainConfig(
+        name="grab_32",
+        # 使用pi0模型，32维动作空间（匹配预训练权重）
+        model=pi0_config.Pi0Config(
+            action_dim=32,  # 32维完全匹配实际数据
+            action_horizon=16,
+        ),
+        data=LeRobotGrab32DataConfig(
+            # repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/lerobot_1&2",
+            repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/turn_3",
+            assets=AssetsConfig(
+                # assets_dir="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/lerobot_1&2",
+                asset_id=None,  # norm_stats.json直接在数据集根目录
+            ),
+            default_prompt="pick up the box",
+        ),
+        # 从pi0_base加载预训练权重
+        weight_loader=weight_loaders.CheckpointWeightLoader("/chenhaiying/ckpts/pi/pi0_base/params"),
+        # 训练超参数
+        num_train_steps=20_000,  # 136个episodes，更多训练步数
+        batch_size=32,
+        save_interval=1000,
+        log_interval=100,
+    ),
+    #
+    # 通用32维机器人微调配置（适用于所有32维任务）
+    #
+    TrainConfig(
+        name="robot_32",
+        # 使用pi0模型，32维动作空间（匹配预训练权重）
+        model=pi0_config.Pi0Config(
+            action_dim=32,  # 32维完全匹配实际数据
+            action_horizon=16,
+        ),
+        data=LeRobot32DataConfig(
+            # 数据集路径（可通过命令行参数覆盖）
+            repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/lerobot_1&2",
+            # repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/turn_3",
+            assets=AssetsConfig(
+                # assets_dir指向数据集根目录（norm_stats.json在根目录）
+                # assets_dir="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/lerobot_1&2",
+                asset_id=None,  # norm_stats.json直接在数据集根目录
+            ),
+            # 默认提示词（可通过命令行参数覆盖，或从数据集的task字段读取）
+            # default_prompt="turn around",
+            default_prompt="pick up the box",
+        ),
+        # 从pi0_base加载预训练权重
+        weight_loader=weight_loaders.CheckpointWeightLoader("/chenhaiying/ckpts/pi/pi0_base/params"),
+        # 训练超参数
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        log_interval=100,
+    ),
+    #
+    # 通用32维机器人微调配置（带腕部相机版本）
+    #
+    TrainConfig(
+        name="robot_32_wrist",
+        # 使用pi0模型，32维动作空间（匹配预训练权重）
+        model=pi0_config.Pi0Config(
+            action_dim=32,  # 32维完全匹配实际数据
+            action_horizon=16,
+        ),
+        data=LeRobot32WristDataConfig(
+            # 数据集路径（可通过命令行参数覆盖）
+            repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/0314_putdown_plus_0123_0206_choose_merged_test",
+            assets=AssetsConfig(
+               
+               
+            ),
+            # 默认提示词（可通过命令行参数覆盖，或从数据集的task字段读取）
+            default_prompt="pick up the box",
+        ),
+        # 从pi0_base加载预训练权重
+        weight_loader=weight_loaders.CheckpointWeightLoader("/chenhaiying/ckpts/pi/pi0_base/params"),
+        # 训练超参数
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        log_interval=100,
+    ),
+
+    TrainConfig(
+        name="robot_32_wrist_pi05",
+        # 使用pi0模型，32维动作空间（匹配预训练权重）
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_dim=32,  # 32维完全匹配实际数据
+            action_horizon=16,
+        ),
+        data=LeRobot32WristDataConfig(
+            # 数据集路径（可通过命令行参数覆盖）
+            repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/0314_putdown_plus_0123_0206_choose_merged_test",
+            assets=AssetsConfig(
+               
+               
+            ),
+            # 默认提示词（可通过命令行参数覆盖，或从数据集的task字段读取）
+            default_prompt="pick up the box",
+        ),
+        # 从pi05_base加载预训练权重
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/ma-user/work/chenhaiying/ckpts/pi/pi05_base/params"),
+        # 训练超参数
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        log_interval=100,
+    ),
+     TrainConfig(
+        name="robot_32_ego",
+        # 使用pi0模型，32维动作空间（匹配预训练权重）
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_dim=32,  # 32维完全匹配实际数据
+            action_horizon=16,
+        ),
+        data=LeRobot32WristDataConfig(
+            # 数据集路径（可通过命令行参数覆盖）
+            repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/0314_putdown_plus_0123_0206_choose_merged_test",
+            assets=AssetsConfig(
+               
+               
+            ),
+        ),
+        # 从pi05_base加载预训练权重
+        weight_loader=weight_loaders.CheckpointWeightLoader("/chenhaiying/ckpts/pi/pi05_base/params"),
+        # 训练超参数
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        name="robot_ego_pi05",
+        # 使用pi0模型，32维动作空间（匹配预训练权重）
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_dim=32,  # 32维完全匹配实际数据
+            action_horizon=16,
+        ),
+        data=EgoCameraDataConfigFactory(
+            repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/0314_putdown_plus_0123_0206_choose_merged_test",
+        ),
+    ),
+    TrainConfig(
+        name="robot_ego_base",
+        # 使用pi0模型，32维动作空间（匹配预训练权重）
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_dim=32,  # 32维完全匹配实际数据
+            action_horizon=16,
+        ),
+        data=EgoCameraData(
+            repo_id="/iag_ad_vepfs_volc/iag_ad_vepfs_volc/wangkeqiu/our_data/0314_putdown_plus_0123_0206_choose_merged_test",
+        ),
+        # 从pi05_base加载预训练权重
+        weight_loader=weight_loaders.CheckpointWeightLoader("/chenhaiying/ckpts/pi/pi05_base/params"),
+        # 训练超参数
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        log_interval=100,
+    ),
+    TrainConfig(
+        name="robot_arm14_eepose_action",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotArm14EeposeActionDataConfig(
+            repo_id="/home/ma-user/work/wkq/robot_data/2026_grab_train_arm14_state_eepose_action",
+            assets=AssetsConfig(asset_id=None),
+            default_prompt="pick up the box",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/ma-user/work/jiaochunxuan/ckpts/pi/pi0_base/params"
+        ),
+        num_train_steps=20_000,
+        batch_size=32,
+        save_interval=1000,
+        log_interval=100,
+    ),
+    
     #
     # Debugging configs.
     #
@@ -965,9 +1517,10 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
-    # RoboArena & PolaRiS configs.
+    #
+    # RoboArena configs.
+    #
     *roboarena_config.get_roboarena_configs(),
-    *polaris_config.get_polaris_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
