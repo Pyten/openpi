@@ -181,9 +181,14 @@ def sample_actions_sft(model, observation, rng, *, num_steps=10):
 
 # ── eval one task ─────────────────────────────────────────────────────────────
 def eval_task(task_id, task_name, task_desc, task_bddl, init_states,
-              infer_fn, tokenize, num_episodes, seed, label):
+              infer_fn, tokenize, norm_stats, num_episodes, seed, label):
     """Run num_episodes on one task, return (successes, total)."""
     from libero.libero.envs import OffScreenRenderEnv
+
+    state_mean = norm_stats["state"].mean.astype(np.float32)
+    state_std  = norm_stats["state"].std.astype(np.float32)
+    action_mean = norm_stats["actions"].mean.astype(np.float32)
+    action_std  = norm_stats["actions"].std.astype(np.float32)
 
     env = OffScreenRenderEnv(
         bddl_file_name=task_bddl,
@@ -209,9 +214,12 @@ def eval_task(task_id, task_name, task_desc, task_bddl, init_states,
         for step_i in range(MAX_STEPS):
             if chunk_step >= REPLAN_STEPS or actions_chunk is None:
                 img, wrist, state = _prep_obs(obs, RESIZE)
+
+                # z-score normalize state (8d), then pad to 32d
+                state_norm = (state - state_mean) / (state_std + 1e-6)
                 state_pad = np.concatenate(
-                    [state, np.zeros(ACTION_DIM - len(state))]
-                ) if len(state) < ACTION_DIM else state
+                    [state_norm, np.zeros(ACTION_DIM - len(state_norm))]
+                ) if len(state_norm) < ACTION_DIM else state_norm
 
                 observation = _model.Observation(
                     images={
@@ -230,8 +238,10 @@ def eval_task(task_id, task_name, task_desc, task_bddl, init_states,
                 )
 
                 rng = jax.random.PRNGKey(seed * 10000 + ep_idx * 1000 + step_i)
-                actions_chunk = np.array(infer_fn(observation, rng))  # (1, 50, 7)
-                actions_chunk = actions_chunk[0, :, :7]
+                actions_raw = np.array(infer_fn(observation, rng))  # (1, 50, 32)
+                # unnormalize first 7 action dims
+                actions_7d = actions_raw[0, :, :7]
+                actions_chunk = actions_7d * (action_std + 1e-6) + action_mean
                 chunk_step = 0
 
             action = actions_chunk[chunk_step]
@@ -278,6 +288,13 @@ def main():
     train_config = _config.get_config("pi0_libero")
     tokenize = make_tokenize_fn(train_config)
 
+    # ── load norm_stats from SFT checkpoint ──────────────────────────────────
+    from openpi.training import checkpoints as _checkpoints
+    norm_stats = _checkpoints.load_norm_stats(
+        pathlib.Path(args.sft_ckpt) / "assets/physical-intelligence", "libero"
+    )
+    print(f"Norm stats loaded: state mean {norm_stats['state'].mean[:3]}", flush=True)
+
     # ── preload task metadata (bddl paths + init_states) ─────────────────────
     from libero.libero import get_libero_path
     import os as _os
@@ -320,7 +337,7 @@ def main():
                 task_id, info["task_name"], info["task_desc"],
                 info["task_bddl"], info["init_states"],
                 lambda obs, rng: sft_infer_fn(rng, obs),
-                tokenize, args.episodes_per_task, args.seed, "SFT",
+                tokenize, norm_stats, args.episodes_per_task, args.seed, "SFT",
             )
             elapsed = time.time() - t0
             sft_results.append(succ / total)
@@ -353,7 +370,7 @@ def main():
                 task_id, info["task_name"], info["task_desc"],
                 info["task_bddl"], info["init_states"],
                 lambda obs, rng: recap_infer_fn(obs, rng),
-                tokenize, args.episodes_per_task, args.seed, "RECAP",
+                tokenize, norm_stats, args.episodes_per_task, args.seed, "RECAP",
             )
             elapsed = time.time() - t0
             recap_results.append(succ / total)
