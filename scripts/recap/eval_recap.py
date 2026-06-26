@@ -43,7 +43,7 @@ HIDDEN_DIM    = 2048
 CFG_BETA      = 2.0
 ACTION_HORIZON = 50
 ACTION_DIM     = 32
-REPLAN_STEPS   = 5
+REPLAN_STEPS   = 10
 MAX_STEPS      = 220
 SUITE_NAME     = "libero_spatial"
 RESIZE         = 224
@@ -75,28 +75,42 @@ def _prep_obs(raw_obs, resize):
 
 # ── model loading ─────────────────────────────────────────────────────────────
 def load_model(ckpt_dir: str, train_config):
+    """Load model from either SFT-style (params/) or RECAP-style (model_params/) checkpoint."""
     model_config = train_config.model
-    ckpt_params_dir = pathlib.Path(ckpt_dir) / "params"
-    if not ckpt_params_dir.exists():
-        ckpt_params_dir = pathlib.Path(ckpt_dir) / "model_params"
-    if not ckpt_params_dir.exists():
-        ckpt_params_dir = pathlib.Path(ckpt_dir)
-
-    raw_params = _model.restore_params(str(ckpt_params_dir), restore_type=np.ndarray)
     model = model_config.create(jax.random.PRNGKey(0))
-    graphdef, state = nnx.split(model)
-    state.replace_by_pure_dict(raw_params)
-    return nnx.merge(graphdef, state)
+
+    ckpt_path = pathlib.Path(ckpt_dir)
+    # Try SFT-style checkpoint (has nested 'params' key)
+    params_dir = ckpt_path / "params"
+    if params_dir.exists():
+        raw_params = _model.restore_params(str(params_dir), restore_type=np.ndarray)
+        graphdef, state = nnx.split(model)
+        state.replace_by_pure_dict(raw_params)
+        return nnx.merge(graphdef, state)
+
+    # RECAP-style checkpoint: NNX state saved directly in model_params/
+    model_params_dir = ckpt_path / "model_params"
+    if not model_params_dir.exists():
+        model_params_dir = ckpt_path  # fallback
+
+    import orbax.checkpoint as ocp
+    model_params = nnx.state(model)
+    ckptr = ocp.StandardCheckpointer()
+    restored_params = ckptr.restore(str(model_params_dir.resolve()), target=model_params)
+    nnx.update(model, restored_params)
+    return model
 
 
 def load_adv_embed(adv_embed_dir: str):
     import orbax.checkpoint as ocp
     adv_embed = nnx.Embed(num_embeddings=2, features=HIDDEN_DIM, rngs=nnx.Rngs(params=jax.random.PRNGKey(42)))
+    adv_params = nnx.state(adv_embed)
     ckptr = ocp.StandardCheckpointer()
-    raw = ckptr.restore(str(pathlib.Path(adv_embed_dir).resolve()))
-    graphdef, state = nnx.split(adv_embed)
-    state.replace_by_pure_dict(raw)
-    return nnx.merge(graphdef, state)
+    restored_params = ckptr.restore(
+        str(pathlib.Path(adv_embed_dir).resolve()), target=adv_params
+    )
+    nnx.update(adv_embed, restored_params)
+    return adv_embed
 
 
 # ── tokenizer helper ──────────────────────────────────────────────────────────
@@ -114,10 +128,9 @@ def make_tokenize_fn(train_config):
 # ── CFG inference (RECAP) ─────────────────────────────────────────────────────
 def sample_actions_cfg(model, adv_embed, observation, rng, *, num_steps=10, beta=CFG_BETA):
     """
-    CFG inference: run conditional (adv=1) and unconditional (adv=0) prefix passes,
-    build separate KV caches, then combine velocities during denoising.
+    CFG inference using Python-level for loop (avoids complex while_loop JIT).
+    Build two KV caches (cond adv=1, uncond adv=0), then denoise with combined velocity.
     """
-    # preprocess observation once
     obs = _model.preprocess_observation(None, observation, train=False)
     B = obs.state.shape[0]
 
@@ -140,38 +153,33 @@ def sample_actions_cfg(model, adv_embed, observation, rng, *, num_steps=10, beta
     noise = jax.random.normal(rng, (B, model.action_horizon, model.action_dim))
     dt = -1.0 / num_steps
 
-    def step(carry):
-        x_t, time_val = carry
+    def run_suffix(x_t, time_val, kv_cache, prefix_mask_aug):
         t_arr = jnp.broadcast_to(time_val, B)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = model.embed_suffix(obs, x_t, t_arr)
-
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        prefix_attn = einops.repeat(prefix_mask_aug, "b p -> b s p", s=suffix_tokens.shape[1])
+        full_mask = jnp.concatenate([prefix_attn, suffix_attn_mask], axis=-1)
+        positions = (jnp.sum(prefix_mask_aug, axis=-1)[:, None]
+                     + jnp.cumsum(suffix_mask, axis=-1) - 1)
+        (_, suffix_out), _ = model.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        return model.action_out_proj(suffix_out[:, -model.action_horizon:])
 
-        def _run_suffix(kv_cache, prefix_mask_aug):
-            prefix_attn = einops.repeat(prefix_mask_aug, "b p -> b s p", s=suffix_tokens.shape[1])
-            full_mask = jnp.concatenate([prefix_attn, suffix_attn_mask], axis=-1)
-            positions = (jnp.sum(prefix_mask_aug, axis=-1)[:, None]
-                         + jnp.cumsum(suffix_mask, axis=-1) - 1)
-            (_, suffix_out), _ = model.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
-            return model.action_out_proj(suffix_out[:, -model.action_horizon:])
-
-        v_cond   = _run_suffix(kv_cond,   prefix_mask_cond)
-        v_uncond = _run_suffix(kv_uncond, prefix_mask_uncond)
+    x_t = noise
+    time_val = 1.0
+    for _ in range(num_steps):
+        v_cond   = run_suffix(x_t, time_val, kv_cond,   prefix_mask_cond)
+        v_uncond = run_suffix(x_t, time_val, kv_uncond, prefix_mask_uncond)
         v_guided = v_uncond + beta * (v_cond - v_uncond)
-        return x_t + dt * v_guided, time_val + dt
+        x_t = x_t + dt * v_guided
+        time_val = time_val + dt
 
-    def cond_fn(carry):
-        _, time_val = carry
-        return time_val >= -dt / 2
-
-    x_0, _ = jax.lax.while_loop(cond_fn, step, (noise, 1.0))
-    return x_0
+    return x_t
 
 
 # ── plain SFT inference ───────────────────────────────────────────────────────
@@ -268,8 +276,8 @@ def main():
     parser.add_argument("--sft-ckpt",   default="checkpoints/pi0_libero/recap_sft_baseline/29999")
     parser.add_argument("--episodes-per-task", type=int, default=20)
     parser.add_argument("--cfg-beta", type=float, default=CFG_BETA)
-    parser.add_argument("--eval-sft",  action="store_true", default=True)
-    parser.add_argument("--eval-recap", action="store_true", default=True)
+    parser.add_argument("--eval-sft",   action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--eval-recap", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -357,8 +365,8 @@ def main():
         adv_embed_dir = str(pathlib.Path(args.recap_ckpt) / "adv_embed")
         adv_embed = load_adv_embed(adv_embed_dir)
 
-        recap_infer_fn = nnx.jit(
-            lambda obs, rng: sample_actions_cfg(recap_model, adv_embed, obs, rng, beta=args.cfg_beta)
+        recap_infer_fn = lambda obs, rng: sample_actions_cfg(
+            recap_model, adv_embed, obs, rng, beta=args.cfg_beta
         )
 
         recap_results = []
