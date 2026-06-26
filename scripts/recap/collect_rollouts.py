@@ -1,0 +1,298 @@
+"""
+Phase 1C: 多进程 Rollout 采集
+策略: serve_policy.py (WebSocket server) + 多进程 worker 并行采集
+
+用法:
+  # 先在另一个终端启动策略 server:
+  # .venv/bin/python scripts/serve_policy.py --env libero \
+  #   --policy.config pi0_libero \
+  #   --policy.dir checkpoints/pi0_libero/recap_sft_baseline/29999 \
+  #   --port 8000
+
+  # 然后启动采集:
+  # MUJOCO_GL=osmesa python collect_rollouts.py
+"""
+
+import collections
+import math
+import multiprocessing as mp
+import os
+import pathlib
+import pickle
+import time
+import traceback
+from dataclasses import dataclass, field
+from typing import List, Dict, Any
+
+import numpy as np
+from libero.libero import benchmark, get_libero_path
+from libero.libero.envs import OffScreenRenderEnv
+from openpi_client import image_tools, websocket_client_policy as _ws_client
+
+# ── constants ────────────────────────────────────────────────────────────────
+POLICY_HOST = "127.0.0.1"
+POLICY_PORT = 8000
+SUITE_NAME   = "libero_spatial"
+NUM_EPISODES = 50          # episodes per task (300 for full RECAP; 50 for quick test)
+MAX_STEPS    = 220         # libero_spatial max
+NUM_WAIT     = 10          # stabilisation steps
+RESIZE       = 224         # image resize
+REPLAN_STEPS = 5           # action chunk stride
+NUM_WORKERS  = 10          # parallel processes (one per task)
+OUTPUT_DIR   = pathlib.Path("/mnt/vepfs/pyten/Programs/code/pi0.6/data/rollouts")
+LOG_DIR      = pathlib.Path("/mnt/vepfs/pyten/Programs/code/pi0.6/logs")
+DUMMY_ACTION = [0.0] * 6 + [-1.0]
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+def _quat2axisangle(quat):
+    if quat[3] > 1.0:  quat[3] = 1.0
+    elif quat[3] < -1.0: quat[3] = -1.0
+    den = math.sqrt(1.0 - quat[3] ** 2)
+    if math.isclose(den, 0.0):
+        return np.zeros(3)
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
+
+
+def _prep_obs(obs, resize):
+    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+    wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+    img   = image_tools.convert_to_uint8(image_tools.resize_with_pad(img,   resize, resize))
+    wrist = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist, resize, resize))
+    state = np.concatenate((
+        obs["robot0_eef_pos"],
+        _quat2axisangle(obs["robot0_eef_quat"]),
+        obs["robot0_gripper_qpos"],
+    ))
+    return img, wrist, state
+
+
+# ── per-task worker ───────────────────────────────────────────────────────────
+def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
+              init_states, num_episodes: int, output_path: pathlib.Path,
+              log_path: pathlib.Path, seed: int):
+    """Each worker runs one LIBERO task, collects num_episodes rollouts."""
+
+    os.environ["MUJOCO_GL"] = "osmesa"
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_f = open(log_path, "w", buffering=1)
+
+    def log(msg):
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}][task{task_id}] {msg}", flush=True)
+        log_f.write(f"[{ts}][task{task_id}] {msg}\n")
+
+    log(f"Starting: {task_name}")
+    log(f"  desc: {task_desc}")
+    log(f"  episodes: {num_episodes}")
+
+    # connect to policy server with retry
+    client = None
+    for attempt in range(30):
+        try:
+            client = _ws_client.WebsocketClientPolicy(POLICY_HOST, POLICY_PORT)
+            log("Connected to policy server")
+            break
+        except Exception as e:
+            if attempt % 5 == 0:
+                log(f"  waiting for policy server... ({e})")
+            time.sleep(2)
+    if client is None:
+        log("ERROR: could not connect to policy server after 60s")
+        return
+
+    # init env
+    try:
+        env = OffScreenRenderEnv(
+            bddl_file_name=task_bddl,
+            camera_heights=256,
+            camera_widths=256,
+        )
+        env.seed(seed)
+    except Exception as e:
+        log(f"ERROR: env init failed: {e}")
+        traceback.print_exc(file=log_f)
+        return
+
+    episodes = []
+    successes = 0
+
+    for ep_idx in range(num_episodes):
+        ep_start = time.time()
+        try:
+            env.reset()
+            # use fixed initial state for reproducibility
+            state_idx = ep_idx % len(init_states)
+            obs = env.set_init_state(init_states[state_idx])
+        except Exception as e:
+            log(f"  ep{ep_idx}: reset failed: {e}")
+            continue
+
+        ep_obs_imgs   = []
+        ep_wrist_imgs = []
+        ep_states     = []
+        ep_actions    = []
+        ep_rewards    = []
+        ep_dones      = []
+
+        action_plan = collections.deque()
+        t = 0
+        done = False
+
+        while t < MAX_STEPS + NUM_WAIT:
+            try:
+                if t < NUM_WAIT:
+                    obs, reward, done, info = env.step(DUMMY_ACTION)
+                    t += 1
+                    continue
+
+                img, wrist, state = _prep_obs(obs, RESIZE)
+
+                if not action_plan:
+                    element = {
+                        "observation/image": img,
+                        "observation/wrist_image": wrist,
+                        "observation/state": state,
+                        "prompt": task_desc,
+                    }
+                    try:
+                        result = client.infer(element)
+                        chunk = result["actions"]
+                        action_plan.extend(chunk[:REPLAN_STEPS])
+                    except Exception as e:
+                        log(f"  ep{ep_idx} t={t}: infer failed: {e}")
+                        break
+
+                action = action_plan.popleft()
+
+                ep_obs_imgs.append(img)
+                ep_wrist_imgs.append(wrist)
+                ep_states.append(state.copy())
+                ep_actions.append(np.array(action, dtype=np.float32))
+
+                obs, reward, done, info = env.step(action.tolist())
+                ep_rewards.append(float(reward))
+                ep_dones.append(bool(done))
+
+                if done:
+                    successes += 1
+                    break
+
+                t += 1
+
+            except Exception as e:
+                log(f"  ep{ep_idx} t={t}: step error: {e}")
+                break
+
+        if len(ep_actions) > 0:
+            episodes.append({
+                "task_id":    task_id,
+                "task_name":  task_name,
+                "prompt":     task_desc,
+                "ep_idx":     ep_idx,
+                "success":    bool(done),
+                "length":     len(ep_actions),
+                "images":     np.stack(ep_obs_imgs),        # (T, H, W, 3) uint8
+                "wrist_imgs": np.stack(ep_wrist_imgs),      # (T, H, W, 3) uint8
+                "states":     np.stack(ep_states),          # (T, 8) float32
+                "actions":    np.stack(ep_actions),         # (T, 7) float32
+                "rewards":    np.array(ep_rewards),
+                "dones":      np.array(ep_dones),
+            })
+
+        ep_time = time.time() - ep_start
+        log(f"  ep{ep_idx}: success={done} len={len(ep_actions)} t={ep_time:.1f}s  [{successes}/{ep_idx+1}]")
+
+    env.close()
+    log_f.close()
+
+    # save
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        pickle.dump(episodes, f)
+
+    print(f"[task{task_id}] Done: {successes}/{num_episodes} success, saved {len(episodes)} eps → {output_path}", flush=True)
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+def main():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    bm_dict = benchmark.get_benchmark_dict()
+    suite   = bm_dict[SUITE_NAME]()
+    n_tasks = suite.n_tasks
+    print(f"Suite: {SUITE_NAME}, tasks: {n_tasks}")
+
+    jobs = []
+    for task_id in range(n_tasks):
+        task       = suite.get_task(task_id)
+        task_bddl  = str(pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file)
+        # PyTorch 2.6 changed torch.load default to weights_only=True which
+        # breaks loading numpy arrays. Patch to load with weights_only=False.
+        import torch, os as _os
+        _benchmark_mod = suite.__class__.__module__.split('.')[0]
+        init_states_path = _os.path.join(
+            get_libero_path("init_states"),
+            suite.tasks[task_id].problem_folder,
+            suite.tasks[task_id].init_states_file,
+        )
+        init_states = torch.load(init_states_path, weights_only=False)
+        out_path   = OUTPUT_DIR / f"task_{task_id:02d}_{task.name}.pkl"
+        log_path   = LOG_DIR / f"rollout_task_{task_id:02d}.log"
+
+        jobs.append(dict(
+            task_id=task_id,
+            task_name=task.name,
+            task_desc=task.language,
+            task_bddl=task_bddl,
+            init_states=init_states,
+            num_episodes=NUM_EPISODES,
+            output_path=out_path,
+            log_path=log_path,
+            seed=42 + task_id,
+        ))
+
+    print(f"Launching {min(NUM_WORKERS, n_tasks)} parallel workers for {n_tasks} tasks × {NUM_EPISODES} eps each")
+    t0 = time.time()
+
+    procs = []
+    for j in jobs:
+        p = mp.Process(target=worker_fn, kwargs=j, daemon=True)
+        p.start()
+        procs.append((p, j["task_id"]))
+        print(f"  Started worker for task {j['task_id']}: {j['task_name']}")
+
+    for p, tid in procs:
+        p.join()
+        print(f"  Worker task {tid} finished (exit={p.exitcode})")
+
+    elapsed = time.time() - t0
+    print(f"\nAll workers done in {elapsed/3600:.2f}h")
+
+    # merge all episode files
+    all_eps = []
+    for j in jobs:
+        fpath = j["output_path"]
+        if fpath.exists():
+            with open(fpath, "rb") as f:
+                eps = pickle.load(f)
+            all_eps.extend(eps)
+            print(f"  task{j['task_id']}: {len(eps)} episodes loaded")
+        else:
+            print(f"  task{j['task_id']}: NO OUTPUT FILE")
+
+    merged_path = OUTPUT_DIR / "all_episodes.pkl"
+    with open(merged_path, "wb") as f:
+        pickle.dump(all_eps, f)
+
+    total    = len(all_eps)
+    n_succ   = sum(1 for e in all_eps if e["success"])
+    print(f"\nMerged {total} episodes, success rate: {n_succ}/{total} = {n_succ/max(total,1)*100:.1f}%")
+    print(f"Saved to {merged_path}")
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+    main()
