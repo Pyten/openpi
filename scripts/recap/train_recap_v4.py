@@ -1,27 +1,22 @@
 """
-Phase 1D v3: RECAP advantage-conditioned policy training (with FSDP)
+Phase 1D v4: RECAP advantage-conditioned policy — FROZEN backbone
 
-Key fix over v2:
-- adv_embed uses separate high lr (default 1e-3) vs model lr (default 5e-6)
-- Added orthogonal regularization loss to force embed[0] != embed[1]
+Key fix over v3: model backbone fully frozen. Only adv_embed is trained.
+This prevents the model from adapting to adv_token position, preserving SFT
+quality while teaching adv_embed the good/bad CFG conditioning direction.
 
 Usage:
   cd /mnt/vepfs/pyten/Programs/code/pi0.6
-  MUJOCO_GL=osmesa nohup .venv/bin/python scripts/recap/train_recap.py \
+  MUJOCO_GL=osmesa nohup .venv/bin/python -u scripts/recap/train_recap_v4.py \
     --sft-ckpt checkpoints/pi0_libero/recap_sft_baseline/29999 \
     --labeled-data data/rollouts/labeled_episodes.pkl \
-    --exp-name recap_policy_v3 \
-    --num-steps 20000 \
-    --batch-size 64 \
-    --lr 5e-6 \
-    --adv-lr 1e-3 \
-    --ortho-lambda 0.1 \
-    --fsdp-devices 4 \
-    > logs/recap_train_v3.log 2>&1 &
+    --exp-name recap_policy_v4 \
+    --num-steps 20000 --batch-size 64 --adv-lr 1e-3 \
+    --ortho-lambda 0.1 --norm-lambda 0.001 --fsdp-devices 4 \
+    > logs/recap_train_v4.log 2>&1 &
 """
 
 import argparse
-import logging
 import os
 import pathlib
 import pickle
@@ -37,20 +32,20 @@ from flax import nnx
 sys.path.insert(0, str(pathlib.Path(__file__).parents[2]))
 os.environ.setdefault("MUJOCO_GL", "osmesa")
 
-from openpi.models import pi0 as _pi0
-from openpi.models import pi0_config
 from openpi.models import model as _model
 from openpi.training import config as _config
 from openpi.training import sharding
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
 
 HIDDEN_DIM       = 2048
 ADV_DROPOUT_RATE = 0.30
 ACTION_HORIZON   = 50
 SAVE_INTERVAL    = 1000
 LOG_INTERVAL     = 50
+
+
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts} {msg}", flush=True)
 
 
 class RolloutDataLoader:
@@ -80,7 +75,7 @@ class RolloutDataLoader:
         self.rng = np.random.default_rng(seed)
         self.batch_size = batch_size
         n_pos = sum(1 for s in self.flat_samples if s["advantage_label"] == 1)
-        logger.info(f"Data: {len(self.flat_samples)} timesteps, {n_pos/len(self.flat_samples)*100:.1f}% positive")
+        log(f"Data: {len(self.flat_samples)} timesteps, {n_pos/len(self.flat_samples)*100:.1f}% positive")
 
     def sample_batch(self, tokenize_fn):
         idx = self.rng.integers(0, len(self.flat_samples), size=self.batch_size)
@@ -94,11 +89,12 @@ class RolloutDataLoader:
         return images, wrist_imgs, states, actions, adv_labels, tokens, token_mask
 
 
-def compute_loss_with_advantage(
-    model, adv_embed, rng, ortho_lambda,
+def compute_loss_adv_only(
+    model, adv_embed, rng, ortho_lambda, norm_lambda,
     images, wrist_images, states, actions, adv_labels,
     tokenized_prompt, tokenized_prompt_mask, train=True,
 ):
+    """Flow matching loss — only adv_embed receives gradients."""
     from openpi.models.pi0 import make_attn_mask
 
     preprocess_rng, noise_rng, time_rng, dropout_rng = jax.random.split(rng, 4)
@@ -159,7 +155,7 @@ def compute_loss_with_advantage(
     attn_mask  = make_attn_mask(input_mask, ar_mask)
     positions  = jnp.cumsum(input_mask, axis=1) - 1
 
-    (prefix_out, suffix_out), _ = model.PaliGemma.llm(
+    (_, suffix_out), _ = model.PaliGemma.llm(
         [prefix_tokens, suffix_tokens],
         mask=attn_mask,
         positions=positions,
@@ -168,42 +164,37 @@ def compute_loss_with_advantage(
     v_t = model.action_out_proj(suffix_out[:, -model.action_horizon:])
     flow_loss = jnp.mean(jnp.square(v_t - u_t))
 
-    # Orthogonal regularization: force embed[0] and embed[1] to be dissimilar.
-    # Without this, with small lr, both embeddings stay nearly identical and CFG
-    # has nothing to amplify at inference time.
-    W = adv_embed.embedding.value  # (2, HIDDEN_DIM)
+    W = adv_embed.embedding.value
     e0 = W[0] / (jnp.linalg.norm(W[0]) + 1e-8)
     e1 = W[1] / (jnp.linalg.norm(W[1]) + 1e-8)
-    ortho_loss = jnp.square(jnp.dot(e0, e1))  # 0 = orthogonal (good), 1 = parallel (bad)
+    ortho_loss = jnp.square(jnp.dot(e0, e1))
+    norm_loss  = jnp.mean(jnp.square(W))
 
-    return flow_loss + ortho_lambda * ortho_loss, flow_loss, ortho_loss
+    total = flow_loss + ortho_lambda * ortho_loss + norm_lambda * norm_loss
+    return total, flow_loss, ortho_loss, norm_loss
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sft-ckpt",      default=None,
-                        help="SFT checkpoint dir (required if not --resume-ckpt)")
-    parser.add_argument("--resume-ckpt",   default=None,
-                        help="RECAP checkpoint dir to resume from")
+    parser.add_argument("--sft-ckpt",      default=None)
+    parser.add_argument("--resume-ckpt",   default=None)
     parser.add_argument("--labeled-data",  required=True)
-    parser.add_argument("--exp-name",      default="recap_policy_v3")
+    parser.add_argument("--exp-name",      default="recap_policy_v4")
     parser.add_argument("--num-steps",     type=int, default=20000)
     parser.add_argument("--batch-size",    type=int, default=64)
-    parser.add_argument("--lr",            type=float, default=5e-6,
-                        help="Main model learning rate")
-    parser.add_argument("--adv-lr",        type=float, default=1e-3,
-                        help="Advantage embedding learning rate (much larger than model lr)")
-    parser.add_argument("--ortho-lambda",  type=float, default=0.1,
-                        help="Weight for orthogonal regularization on adv_embed")
+    parser.add_argument("--adv-lr",        type=float, default=1e-3)
+    parser.add_argument("--ortho-lambda",  type=float, default=0.1)
+    parser.add_argument("--norm-lambda",   type=float, default=0.001)
     parser.add_argument("--ckpt-base-dir", default="checkpoints")
     parser.add_argument("--fsdp-devices",  type=int, default=4)
     args = parser.parse_args()
     if args.resume_ckpt is None and args.sft_ckpt is None:
         parser.error("Either --sft-ckpt or --resume-ckpt is required")
 
-    logger.info(f"JAX devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
-    logger.info(f"Config: steps={args.num_steps}, batch={args.batch_size}, "
-                f"lr={args.lr}, adv_lr={args.adv_lr}, ortho_lambda={args.ortho_lambda}")
+    log(f"JAX devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
+    log(f"Config: steps={args.num_steps}, batch={args.batch_size}, "
+        f"adv_lr={args.adv_lr}, ortho_lambda={args.ortho_lambda}, "
+        f"norm_lambda={args.norm_lambda}  [FROZEN BACKBONE]")
 
     if args.batch_size % jax.device_count() != 0:
         raise ValueError(f"batch_size {args.batch_size} must be divisible by {jax.device_count()}")
@@ -213,7 +204,7 @@ def main():
     mesh = sharding.make_mesh(args.fsdp_devices)
     data_sharding       = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    logger.info(f"Mesh: {mesh.shape}")
+    log(f"Mesh: {mesh.shape}")
 
     train_config = _config.get_config("pi0_libero")
     model_config = train_config.model
@@ -226,17 +217,24 @@ def main():
             start_step = int(resume_path.name)
         except ValueError:
             start_step = 0
-        logger.info(f"Resuming from RECAP checkpoint: {resume_path} (start_step={start_step})")
+        log(f"Resuming adv_embed from: {resume_path} (start_step={start_step})")
         def _init_model(rng):
             m = model_config.create(rng)
             m_state = nnx.state(m)
-            ckptr = ocp.StandardCheckpointer()
-            restored = ckptr.restore(str((resume_path / "model_params").resolve()), target=m_state)
+            ckptr_r = ocp.StandardCheckpointer()
+            restored = ckptr_r.restore(str((resume_path / "model_params").resolve()), target=m_state)
             nnx.update(m, restored)
             return m
+        def _init_adv(rng):
+            a = nnx.Embed(num_embeddings=2, features=HIDDEN_DIM, rngs=nnx.Rngs(params=rng))
+            a_state = nnx.state(a)
+            ckptr_r = ocp.StandardCheckpointer()
+            restored = ckptr_r.restore(str((resume_path / "adv_embed").resolve()), target=a_state)
+            nnx.update(a, restored)
+            return a
     else:
         start_step = 0
-        logger.info("Loading SFT checkpoint...")
+        log("Loading SFT checkpoint (backbone will be FROZEN)...")
         ckpt_params_dir = pathlib.Path(args.sft_ckpt) / "params"
         if not ckpt_params_dir.exists():
             ckpt_params_dir = pathlib.Path(args.sft_ckpt)
@@ -246,53 +244,27 @@ def main():
             graphdef, state = nnx.split(m)
             state.replace_by_pure_dict(raw_params)
             return nnx.merge(graphdef, state)
+        def _init_adv(rng):
+            return nnx.Embed(num_embeddings=2, features=HIDDEN_DIM, rngs=nnx.Rngs(params=rng))
 
     model = _init_model(jax.random.PRNGKey(0))
-    logger.info("Model loaded.")
+    adv_embed = _init_adv(jax.random.PRNGKey(42))
+    log("Model (frozen) and adv_embed loaded.")
 
-    # Always fresh-init adv_embed from scratch (no resume — previous run barely moved it anyway)
-    adv_embed = nnx.Embed(num_embeddings=2, features=HIDDEN_DIM, rngs=nnx.Rngs(params=jax.random.PRNGKey(42)))
-    logger.info("adv_embed initialized fresh (orthogonal init via random seed).")
-
-    # Separate optimizers: high lr for adv_embed, cosine decay for model
-    warmup_steps = min(200, max(1, args.num_steps // 10))
-    lr_sched = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=args.lr,
-        warmup_steps=warmup_steps,
-        decay_steps=max(args.num_steps, warmup_steps + 1),
-    )
-    model_tx = optax.adamw(lr_sched, weight_decay=1e-4)
-    adv_tx   = optax.adamw(args.adv_lr, weight_decay=0.0)  # flat lr, no wd for tiny embed
-
-    freeze_filter    = model_config.get_freeze_filter()
-    trainable_filter = nnx.All(nnx.Param, nnx.Not(freeze_filter))
+    adv_tx = optax.adamw(args.adv_lr, weight_decay=0.0)
 
     model_params = nnx.state(model)
     adv_params   = nnx.state(adv_embed)
 
-    model_params_shape = jax.eval_shape(lambda: model_params)
+    model_params_shape    = jax.eval_shape(lambda: model_params)
     model_params_sharding = sharding.fsdp_sharding(model_params_shape, mesh, log=True)
 
     model_params = jax.device_put(model_params, model_params_sharding)
     adv_params   = jax.device_put(adv_params,   replicated_sharding)
-    logger.info("Params sharded. Initializing optimizer states...")
 
-    trainable_mp  = model_params.filter(trainable_filter)
-    opt_state     = model_tx.init(trainable_mp)
     adv_opt_state = adv_tx.init(adv_params)
-
-    opt_state_shape    = jax.eval_shape(lambda: opt_state)
-    opt_state_sharding = sharding.fsdp_sharding(opt_state_shape, mesh)
-    opt_state          = jax.device_put(opt_state,     opt_state_sharding)
-    adv_opt_state      = jax.device_put(adv_opt_state, replicated_sharding)
-
-    state_sharding = {
-        "model_params":  model_params_sharding,
-        "opt_state":     opt_state_sharding,
-        "adv_params":    replicated_sharding,
-        "adv_opt_state": replicated_sharding,
-    }
-    logger.info("Train state sharded across GPUs.")
+    adv_opt_state = jax.device_put(adv_opt_state, replicated_sharding)
+    log("adv_embed optimizer initialized. Model backbone FROZEN.")
 
     data_loader = RolloutDataLoader(pathlib.Path(args.labeled_data), args.batch_size)
 
@@ -307,55 +279,47 @@ def main():
     model_graphdef = nnx.graphdef(model)
     adv_graphdef   = nnx.graphdef(adv_embed)
     ortho_lambda   = args.ortho_lambda
+    norm_lambda    = args.norm_lambda
 
-    def train_step(model_params, opt_state, adv_params, adv_opt_state,
+    def train_step(model_params, adv_params, adv_opt_state,
                    images, wrist_images, states, actions, adv_labels,
                    tokens, token_mask, rng):
 
         m = nnx.merge(model_graphdef, model_params)
         a = nnx.merge(adv_graphdef, adv_params)
-        m.train()
+        m.eval()
 
-        def loss_fn(model, adv_embed):
-            total, flow, ortho = compute_loss_with_advantage(
-                model, adv_embed, rng, ortho_lambda,
+        def loss_fn(adv_embed):
+            total, flow, ortho, norm = compute_loss_adv_only(
+                m, adv_embed, rng, ortho_lambda, norm_lambda,
                 images, wrist_images, states, actions, adv_labels,
                 tokens, token_mask, train=True,
             )
-            return total, (flow, ortho)
+            return total, (flow, ortho, norm)
 
-        diff_state_model = nnx.DiffState(0, trainable_filter)
-        diff_state_adv   = nnx.DiffState(1, nnx.Param)
-        (total_loss, (flow_loss, ortho_loss)), (model_grads, adv_grads) = nnx.value_and_grad(
-            loss_fn, argnums=(diff_state_model, diff_state_adv), has_aux=True
-        )(m, a)
-
-        trainable_mp = model_params.filter(trainable_filter)
-        mp_updates, new_opt_state = model_tx.update(model_grads, opt_state, trainable_mp)
-        new_trainable_mp = optax.apply_updates(trainable_mp, mp_updates)
-        nnx.update(m, new_trainable_mp)
-        new_model_params = nnx.state(m)
+        diff_state_adv = nnx.DiffState(0, nnx.Param)
+        (total_loss, (flow_loss, ortho_loss, norm_loss)), (adv_grads,) = nnx.value_and_grad(
+            loss_fn, argnums=(diff_state_adv,), has_aux=True
+        )(a)
 
         ap_updates, new_adv_opt_state = adv_tx.update(adv_grads, adv_opt_state, adv_params)
         new_adv_params = optax.apply_updates(adv_params, ap_updates)
 
-        return new_model_params, new_opt_state, new_adv_params, new_adv_opt_state, total_loss, flow_loss, ortho_loss
+        return model_params, new_adv_params, new_adv_opt_state, total_loss, flow_loss, ortho_loss, norm_loss
 
     train_step_jit = jax.jit(
         train_step,
         in_shardings=(
-            state_sharding["model_params"], state_sharding["opt_state"],
-            replicated_sharding, replicated_sharding,
+            model_params_sharding, replicated_sharding, replicated_sharding,
             data_sharding, data_sharding, data_sharding, data_sharding, data_sharding,
             data_sharding, data_sharding,
             replicated_sharding,
         ),
         out_shardings=(
-            state_sharding["model_params"], state_sharding["opt_state"],
-            replicated_sharding, replicated_sharding,
-            replicated_sharding, replicated_sharding, replicated_sharding,
+            model_params_sharding, replicated_sharding, replicated_sharding,
+            replicated_sharding, replicated_sharding, replicated_sharding, replicated_sharding,
         ),
-        donate_argnums=(0, 1, 2, 3),
+        donate_argnums=(1, 2),
     )
 
     ckpt_dir = pathlib.Path(args.ckpt_base_dir).resolve() / "pi0_libero" / args.exp_name
@@ -364,7 +328,7 @@ def main():
     rng = jax.random.PRNGKey(7)
     t0  = time.time()
     total_steps = start_step + args.num_steps
-    logger.info(f"Starting RECAP training from step {start_step+1} to {total_steps}...")
+    log(f"Starting RECAP v4 training from step {start_step+1} to {total_steps}...")
 
     for step in range(start_step + 1, total_steps + 1):
         rng, step_rng = jax.random.split(rng)
@@ -383,9 +347,9 @@ def main():
         tmask_d      = _to_device(token_mask, data_sharding)
 
         with sharding.set_mesh(mesh):
-            (model_params, opt_state, adv_params, adv_opt_state,
-             total_loss, flow_loss, ortho_loss) = train_step_jit(
-                model_params, opt_state, adv_params, adv_opt_state,
+            (model_params, adv_params, adv_opt_state,
+             total_loss, flow_loss, ortho_loss, norm_loss) = train_step_jit(
+                model_params, adv_params, adv_opt_state,
                 images_d, wrist_d, states_d, actions_d, adv_labels_d,
                 tokens_d, tmask_d, step_rng,
             )
@@ -394,14 +358,18 @@ def main():
             elapsed = time.time() - t0
             rate    = LOG_INTERVAL / elapsed
             remain  = (total_steps - step) / rate
-            logger.info(f"Step {step:5d}/{total_steps} "
-                        f"loss={float(total_loss):.4f} flow={float(flow_loss):.4f} "
-                        f"ortho={float(ortho_loss):.4f} "
-                        f"rate={rate:.2f}s/s remaining={remain/3600:.2f}h")
+            W = np.array(jax.device_get(adv_params.embedding.value))
+            e0_n = np.linalg.norm(W[0])
+            e1_n = np.linalg.norm(W[1])
+            cos  = np.dot(W[0], W[1]) / (e0_n * e1_n + 1e-8)
+            log(f"Step {step:5d}/{total_steps} "
+                f"loss={float(total_loss):.4f} flow={float(flow_loss):.4f} "
+                f"ortho={float(ortho_loss):.4f} norm={float(norm_loss):.4f} "
+                f"e0={e0_n:.4f} e1={e1_n:.4f} cos={cos:.4f} "
+                f"rate={rate:.2f}s/s eta={remain/3600:.2f}h")
             t0 = time.time()
 
         if step % SAVE_INTERVAL == 0 or step == total_steps:
-            import orbax.checkpoint as ocp
             import shutil
             step_dir = ckpt_dir / str(step)
             step_dir.mkdir(parents=True, exist_ok=True)
@@ -418,9 +386,9 @@ def main():
             ckptr.wait_until_finished()
             ckptr.save(adv_embed_dir, host_adv_params)
             ckptr.wait_until_finished()
-            logger.info(f"Checkpoint saved: {step_dir}")
+            log(f"Checkpoint saved: {step_dir}")
 
-    logger.info("RECAP training complete.")
+    log("RECAP v4 training complete.")
 
 
 if __name__ == "__main__":
