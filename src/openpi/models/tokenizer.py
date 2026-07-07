@@ -1,5 +1,6 @@
 import logging
 import os
+import pathlib
 
 import jax
 import numpy as np
@@ -11,11 +12,22 @@ import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
 
+
+
+def _get_paligemma_tokenizer_path() -> pathlib.Path:
+    """Check PALIGEMMA_TOKENIZER_PATH env var first to avoid remote download."""
+    local_override = os.getenv("PALIGEMMA_TOKENIZER_PATH")
+    if local_override:
+        p = pathlib.Path(local_override).expanduser()
+        if p.exists():
+            return p
+    return download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+
 class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
         self._max_len = max_len
 
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _get_paligemma_tokenizer_path()
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -53,7 +65,7 @@ class FASTTokenizer:
         self._max_len = max_len
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _get_paligemma_tokenizer_path()
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -155,7 +167,7 @@ class BinningTokenizer:
         self._n_bins = n_bins
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _get_paligemma_tokenizer_path()
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -291,7 +303,7 @@ class FSQTokenizer:
         )
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        path = _get_paligemma_tokenizer_path()
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
