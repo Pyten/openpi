@@ -196,10 +196,15 @@ def main():
                         help="ARFM temperature: higher = more advantage-weighted")
     parser.add_argument("--ckpt-base-dir", default="checkpoints")
     parser.add_argument("--fsdp-devices",  type=int,   default=4)
+    parser.add_argument("--save-interval", type=int,   default=200,
+                        help="Save checkpoint every N steps (default 200 for Phase 1)")
+    parser.add_argument("--seed",          type=int,   default=0,
+                        help="Training seed for data sampling and flow-matching noise")
     args = parser.parse_args()
 
     log(f"JAX devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
-    log(f"ARFM: lr={args.lr}, alpha={args.alpha}, steps={args.num_steps}, batch={args.batch_size}")
+    log(f"ARFM: lr={args.lr}, alpha={args.alpha}, steps={args.num_steps}, "
+        f"batch={args.batch_size}, seed={args.seed}")
 
     jax.config.update("jax_compilation_cache_dir", str(pathlib.Path("~/.cache/jax").expanduser()))
 
@@ -218,7 +223,7 @@ def main():
     if not ckpt_params_dir.exists():
         ckpt_params_dir = pathlib.Path(args.sft_ckpt)
     raw_params = _model.restore_params(str(ckpt_params_dir), restore_type=np.ndarray)
-    model = model_config.create(jax.random.PRNGKey(0))
+    model = model_config.create(jax.random.PRNGKey(args.seed))
     graphdef, state = nnx.split(model)
     state.replace_by_pure_dict(raw_params)
     model = nnx.merge(graphdef, state)
@@ -229,7 +234,7 @@ def main():
     # Optimizer (full fine-tuning, cosine decay)
     lr_sched = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=args.lr,
-        warmup_steps=500, decay_steps=args.num_steps,
+        warmup_steps=min(500, args.num_steps // 4), decay_steps=args.num_steps,
     )
     tx = optax.adamw(lr_sched, weight_decay=1e-4)
 
@@ -242,7 +247,9 @@ def main():
     opt_state = jax.device_put(opt_state, replicated_sharding)
     log("Optimizer initialized.")
 
-    data_loader = RolloutDataLoader(pathlib.Path(args.labeled_data), args.batch_size)
+    data_loader = RolloutDataLoader(
+        pathlib.Path(args.labeled_data), args.batch_size, seed=args.seed
+    )
 
     from openpi.models.tokenizer import PaligemmaTokenizer
     tokenizer = PaligemmaTokenizer(max_len=train_config.model.max_token_len)
@@ -296,9 +303,11 @@ def main():
     ckpt_dir = pathlib.Path(args.ckpt_base_dir).resolve() / "pi0_libero" / args.exp_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    rng = jax.random.PRNGKey(9)
+    # Preserve the historical seed-0 trajectory while making retrains reproducible.
+    rng = jax.random.PRNGKey(9 + args.seed)
     t0  = time.time()
     total_steps = args.num_steps
+    save_interval = args.save_interval
     log(f"Starting ARFM training, steps=1..{total_steps} ...")
 
     for step in range(1, total_steps + 1):
@@ -332,7 +341,7 @@ def main():
                 f"rate={rate:.2f}s/s eta={remain/3600:.2f}h")
             t0 = time.time()
 
-        if step % SAVE_INTERVAL == 0 or step == total_steps:
+        if step % save_interval == 0 or step == total_steps:
             import shutil
             step_dir = ckpt_dir / str(step)
             step_dir.mkdir(parents=True, exist_ok=True)
