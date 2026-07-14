@@ -12,6 +12,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from openpi.recap.conditioning import ConditioningState
+from openpi.recap.conditioning import apply_condition_dropout
+from openpi.recap.conditioning import combine_cfg
+
 
 # ============================================================
 # 1. 分布式价值函数 (Distributional Value Function)
@@ -243,17 +247,18 @@ class AdvantageComputer:
         return labeled_episodes
     
     def _predict_values(self, episode: dict, params: dict) -> np.ndarray:
-        """用价值函数预测 episode 中每步的价值（占位实现）"""
-        # 实际实现需要调用价值函数模型推理
-        T = len(episode['rewards'])
-        return np.zeros(T, dtype=np.float32)  # placeholder
+        """Require a learned value inference implementation before labeling."""
+        raise NotImplementedError(
+            "Value inference is not implemented in recap_core; attach learned "
+            "value_predictions before computing RECAP advantages"
+        )
 
 
 class AdvantageLabel:
     """优势标签常量"""
     POSITIVE = 1
     NEGATIVE = 0
-    DROPOUT = -1  # 训练时 30% dropout
+    UNCONDITIONAL = 2
 
 
 # ============================================================
@@ -276,7 +281,7 @@ class AdvantageConditioner:
 
     实际集成方式 (openpi/π0.5):
     - 在 PaliGemma VLM 的 input token 序列最前面插入 1 个 advantage token
-    - advantage embedding 作为 nn.Embed(2, hidden_dim) 添加到模型中
+    - advantage embedding 使用 negative / positive / null 三个独立状态
     - 训练时在 forward pass 内部做 dropout (非数据预处理阶段)
     - 推理时分别用 advantage=1 和 advantage=0 做两次前向，用 CFG 组合
     """
@@ -321,8 +326,7 @@ class AdvantageConditioner:
                 p=1 - self.dropout_rate,
                 shape=(B,),
             ).astype(jnp.int32)
-            effective_labels = advantage_labels * dropout_mask
-            # dropout 的样本标签设为 0 (negative = unconditional)
+            effective_labels = apply_condition_dropout(advantage_labels, dropout_mask)
         else:
             effective_labels = advantage_labels
             dropout_mask = jnp.ones(B, dtype=jnp.int32)
@@ -387,11 +391,7 @@ class CFGPolicy:
         
         guided_v = unconditional_v + β · (conditional_v - unconditional_v)
         """
-        guided_velocity = (
-            unconditional_velocity 
-            + self.beta * (conditional_velocity - unconditional_velocity)
-        )
-        return guided_velocity
+        return combine_cfg(unconditional_velocity, conditional_velocity, self.beta)
     
     def sample_with_cfg(
         self,
@@ -420,8 +420,10 @@ class CFGPolicy:
             # 有条件推理 (advantage = positive)
             v_cond = policy_model.predict_velocity(x, t, observation, advantage=1)
             
-            # 无条件推理 (advantage = negative / dropped)
-            v_uncond = policy_model.predict_velocity(x, t, observation, advantage=0)
+            # 无条件推理使用独立 null 状态，而不是 negative 标签
+            v_uncond = policy_model.predict_velocity(
+                x, t, observation, advantage=int(ConditioningState.UNCONDITIONAL)
+            )
             
             # CFG 组合
             v_guided = self.guided_flow_step(v_cond, v_uncond)

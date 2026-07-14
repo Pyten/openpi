@@ -3,7 +3,7 @@ Phase 1E: Evaluate RECAP policy vs SFT baseline on LIBERO spatial tasks.
 
 RECAP inference uses CFG (beta=2.0):
   v_guided = v_uncond + beta * (v_cond - v_uncond)
-  where cond = adv_label=1, uncond = adv_label=0
+  where cond = positive state and uncond = a distinct null-conditioning state
 
 Usage:
   cd /mnt/vepfs/pyten/Programs/code/pi0.6
@@ -44,16 +44,19 @@ from openpi.models import pi0 as _pi0
 from openpi.models import model as _model
 from openpi.training import config as _config
 from openpi.models.pi0 import make_attn_mask
+from openpi.recap.conditioning import ConditioningState
+from openpi.recap.conditioning import combine_cfg
+from openpi.recap import evaluation_protocol as protocol
 from openpi.shared import nnx_utils
 
 HIDDEN_DIM    = 2048
 CFG_BETA      = 2.0
-ACTION_HORIZON = 50
-ACTION_DIM     = 32
-REPLAN_STEPS   = 10
-MAX_STEPS      = 220
-SUITE_NAME     = "libero_spatial"
-RESIZE         = 224
+ACTION_HORIZON = protocol.ACTION_HORIZON
+ACTION_DIM = protocol.ACTION_DIM
+REPLAN_STEPS = protocol.REPLAN_STEPS
+MAX_STEPS = protocol.MAX_STEPS
+SUITE_NAME = protocol.SUITE_NAME
+RESIZE = protocol.RESIZE
 
 
 # ── env helpers (same as collect_rollouts.py) ─────────────────────────────────
@@ -110,7 +113,11 @@ def load_model(ckpt_dir: str, train_config):
 
 def load_adv_embed(adv_embed_dir: str):
     import orbax.checkpoint as ocp
-    adv_embed = nnx.Embed(num_embeddings=2, features=HIDDEN_DIM, rngs=nnx.Rngs(params=jax.random.PRNGKey(42)))
+    adv_embed = nnx.Embed(
+        num_embeddings=len(ConditioningState),
+        features=HIDDEN_DIM,
+        rngs=nnx.Rngs(params=jax.random.PRNGKey(42)),
+    )
     adv_params = nnx.state(adv_embed)
     ckptr = ocp.StandardCheckpointer()
     restored_params = ckptr.restore(
@@ -185,8 +192,12 @@ def make_cfg_infer_fn(model, adv_embed, *, num_steps=10, beta=CFG_BETA):
         obs = _model.preprocess_observation(None, observation, train=False)
         B = obs.state.shape[0]
 
-        kv_cond,   prefix_mask_cond   = build_kv_cache(model_state, adv_state, obs, jnp.int32(1))
-        kv_uncond, prefix_mask_uncond = build_kv_cache(model_state, adv_state, obs, jnp.int32(0))
+        kv_cond, prefix_mask_cond = build_kv_cache(
+            model_state, adv_state, obs, jnp.int32(ConditioningState.POSITIVE)
+        )
+        kv_uncond, prefix_mask_uncond = build_kv_cache(
+            model_state, adv_state, obs, jnp.int32(ConditioningState.UNCONDITIONAL)
+        )
 
         noise = jax.random.normal(rng, (B, model.action_horizon, model.action_dim))
         dt = -1.0 / num_steps
@@ -196,7 +207,7 @@ def make_cfg_infer_fn(model, adv_embed, *, num_steps=10, beta=CFG_BETA):
         for _ in range(num_steps):
             v_cond   = run_suffix_step(model_state, obs, x_t, time_val, kv_cond,   prefix_mask_cond)
             v_uncond = run_suffix_step(model_state, obs, x_t, time_val, kv_uncond, prefix_mask_uncond)
-            v_guided = v_uncond + beta * (v_cond - v_uncond)
+            v_guided = combine_cfg(v_uncond, v_cond, beta)
             x_t = x_t + dt * v_guided
             time_val = time_val + dt
 
@@ -234,7 +245,7 @@ def eval_task(task_id, task_name, task_desc, task_bddl, init_states,
         env.set_init_state(init_state)
 
         # warm-up steps
-        for _ in range(10):
+        for _ in range(protocol.NUM_WAIT_STEPS):
             obs, _, _, _ = env.step([0.0] * 6 + [-1.0])
 
         tokens, token_mask = tokenize(task_desc)
@@ -268,7 +279,7 @@ def eval_task(task_id, task_name, task_desc, task_bddl, init_states,
                     tokenized_prompt_mask=jnp.array(token_mask),
                 )
 
-                rng = jax.random.PRNGKey(seed * 10000 + ep_idx * 1000 + step_i)
+                rng = jax.random.PRNGKey(protocol.action_rng_seed(seed, ep_idx, step_i))
                 actions_raw = np.array(infer_fn(observation, rng))  # (1, 50, 32)
                 # unnormalize first 7 action dims
                 actions_7d = actions_raw[0, :, :7]
@@ -301,12 +312,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--recap-ckpt", default="checkpoints/pi0_libero/recap_policy/10000")
     parser.add_argument("--sft-ckpt",   default="checkpoints/pi0_libero/recap_sft_baseline/29999")
-    parser.add_argument("--episodes-per-task", type=int, default=20)
+    parser.add_argument(
+        "--episodes-per-task", type=int, default=protocol.EPISODES_PER_TASK
+    )
     parser.add_argument("--cfg-beta", type=float, default=CFG_BETA)
     parser.add_argument("--eval-sft",   action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eval-recap", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+
+    print(
+        "Protocol: "
+        f"suite={SUITE_NAME} episodes/task={args.episodes_per_task} seed={args.seed} "
+        f"wait={protocol.NUM_WAIT_STEPS} max_steps={MAX_STEPS} "
+        f"replan={REPLAN_STEPS} flow_steps={protocol.FLOW_STEPS}",
+        flush=True,
+    )
 
     print(f"JAX devices: {jax.device_count()} x {jax.devices()[0].device_kind}", flush=True)
 

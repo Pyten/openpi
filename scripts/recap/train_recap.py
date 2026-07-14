@@ -40,6 +40,8 @@ os.environ.setdefault("MUJOCO_GL", "osmesa")
 from openpi.models import pi0 as _pi0
 from openpi.models import pi0_config
 from openpi.models import model as _model
+from openpi.recap.conditioning import ConditioningState
+from openpi.recap.conditioning import apply_condition_dropout
 from openpi.training import config as _config
 from openpi.training import sharding
 
@@ -142,8 +144,8 @@ def compute_loss_with_advantage(
     prefix_tokens, prefix_mask, prefix_ar_mask = model.embed_prefix(obs)
 
     if train:
-        keep = jax.random.bernoulli(dropout_rng, p=1.0 - ADV_DROPOUT_RATE, shape=(B,)).astype(jnp.int32)
-        effective_labels = adv_labels * keep
+        keep = jax.random.bernoulli(dropout_rng, p=1.0 - ADV_DROPOUT_RATE, shape=(B,))
+        effective_labels = apply_condition_dropout(adv_labels, keep)
     else:
         effective_labels = adv_labels
 
@@ -168,13 +170,12 @@ def compute_loss_with_advantage(
     v_t = model.action_out_proj(suffix_out[:, -model.action_horizon:])
     flow_loss = jnp.mean(jnp.square(v_t - u_t))
 
-    # Orthogonal regularization: force embed[0] and embed[1] to be dissimilar.
-    # Without this, with small lr, both embeddings stay nearly identical and CFG
-    # has nothing to amplify at inference time.
-    W = adv_embed.embedding.value  # (2, HIDDEN_DIM)
-    e0 = W[0] / (jnp.linalg.norm(W[0]) + 1e-8)
-    e1 = W[1] / (jnp.linalg.norm(W[1]) + 1e-8)
-    ortho_loss = jnp.square(jnp.dot(e0, e1))  # 0 = orthogonal (good), 1 = parallel (bad)
+    # Keep negative, positive, and null embeddings distinct.
+    W = adv_embed.embedding.value
+    normalized = W / (jnp.linalg.norm(W, axis=1, keepdims=True) + 1e-8)
+    gram = normalized @ normalized.T
+    off_diagonal = gram - jnp.eye(gram.shape[0], dtype=gram.dtype)
+    ortho_loss = jnp.sum(jnp.square(off_diagonal)) / (gram.shape[0] * (gram.shape[0] - 1))
 
     return flow_loss + ortho_lambda * ortho_loss, flow_loss, ortho_loss
 
@@ -251,7 +252,11 @@ def main():
     logger.info("Model loaded.")
 
     # Always fresh-init adv_embed from scratch (no resume — previous run barely moved it anyway)
-    adv_embed = nnx.Embed(num_embeddings=2, features=HIDDEN_DIM, rngs=nnx.Rngs(params=jax.random.PRNGKey(42)))
+    adv_embed = nnx.Embed(
+        num_embeddings=len(ConditioningState),
+        features=HIDDEN_DIM,
+        rngs=nnx.Rngs(params=jax.random.PRNGKey(42)),
+    )
     logger.info("adv_embed initialized fresh (orthogonal init via random seed).")
 
     # Separate optimizers: high lr for adv_embed, cosine decay for model
