@@ -48,6 +48,101 @@ def binary_metrics(labels: np.ndarray, probabilities: np.ndarray, bins: int = 10
     return {"auroc": auc, "brier": brier, "ece": ece}
 
 
+def summarize_outputs(
+    labels: np.ndarray,
+    probabilities: np.ndarray,
+    episode_ids: list[str],
+    train_prior: float,
+) -> dict[str, Any]:
+    """Report frame and episode metrics from per-frame predictions."""
+    frame_metrics = binary_metrics(labels, probabilities)
+    episodes: dict[str, list[tuple[float, float]]] = {}
+    for episode_id, label, probability in zip(
+        episode_ids, labels, probabilities, strict=True
+    ):
+        episodes.setdefault(episode_id, []).append((float(label), float(probability)))
+    episode_labels = np.asarray([values[0][0] for values in episodes.values()])
+    episode_probabilities = np.asarray(
+        [np.mean([item[1] for item in values]) for values in episodes.values()]
+    )
+    return {
+        "frames": int(len(labels)),
+        "episodes": int(len(episodes)),
+        "frame": frame_metrics,
+        "episode": binary_metrics(episode_labels, episode_probabilities),
+        "constant_prior": binary_metrics(
+            episode_labels, np.full_like(episode_labels, train_prior, dtype=np.float64)
+        ),
+    }
+
+
+def fit_temperature(logits: np.ndarray, labels: np.ndarray) -> float:
+    """Fit one positive temperature on validation logits only."""
+    logit_tensor = torch.as_tensor(logits, dtype=torch.float64)
+    label_tensor = torch.as_tensor(labels, dtype=torch.float64)
+    log_temperature = torch.nn.Parameter(torch.zeros((), dtype=torch.float64))
+    optimizer = torch.optim.LBFGS(
+        [log_temperature], lr=0.1, max_iter=100, line_search_fn="strong_wolfe"
+    )
+
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad()
+        temperature = log_temperature.exp().clamp(0.05, 20.0)
+        loss = F.binary_cross_entropy_with_logits(
+            logit_tensor / temperature, label_tensor
+        )
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return float(log_temperature.exp().clamp(0.05, 20.0).detach())
+
+
+def progress_heuristic(
+    samples: list[tuple[str, dict[str, Any], int]],
+    bins: int = 10,
+    smoothing: float = 1.0,
+) -> dict[int, float]:
+    """Estimate success probability from train-only progress bins."""
+    sums = np.zeros(bins, dtype=np.float64)
+    counts = np.zeros(bins, dtype=np.float64)
+    seen_episodes: set[tuple[str, int]] = set()
+    for episode_id, episode, timestep in samples:
+        # Each episode contributes once per progress bin, avoiding frame weighting.
+        progress = timestep / max(len(episode["actions"]) - 1, 1)
+        index = min(int(progress * bins), bins - 1)
+        if (episode_id, index) in seen_episodes:
+            continue
+        seen_episodes.add((episode_id, index))
+        sums[index] += float(episode["success"])
+        counts[index] += 1.0
+    prior = sums.sum() / max(counts.sum(), 1.0)
+    estimates = {}
+    for index in range(bins):
+        denominator = counts[index] + smoothing
+        estimates[index] = float(
+            (sums[index] + smoothing * prior) / denominator
+            if denominator
+            else prior
+        )
+    return estimates
+
+
+def heuristic_outputs(
+    samples: list[tuple[str, dict[str, Any], int]],
+    estimates: dict[int, float],
+    bins: int = 10,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    labels, probabilities, episode_ids = [], [], []
+    for episode_id, episode, timestep in samples:
+        progress = timestep / max(len(episode["actions"]) - 1, 1)
+        index = min(int(progress * bins), bins - 1)
+        labels.append(float(episode["success"]))
+        probabilities.append(estimates[index])
+        episode_ids.append(episode_id)
+    return np.asarray(labels), np.asarray(probabilities), episode_ids
+
+
 def load_split_references(metadata_dir: Path, split: str, task_id: int) -> list[dict[str, Any]]:
     payload = json.loads((metadata_dir / f"{split}.json").read_text())
     return [record for record in payload["episodes"] if record["task_id"] == task_id]
@@ -113,32 +208,40 @@ class ValuePrototype(nn.Module):
         return self.head(features).squeeze(-1)
 
 
-def evaluate(
-    model: nn.Module, loader: DataLoader, device: torch.device, train_prior: float
-) -> dict[str, Any]:
+def predict_outputs(
+    model: nn.Module, loader: DataLoader, device: torch.device
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     model.eval()
-    labels, probabilities, episode_ids = [], [], []
+    labels, logits, progresses, episode_ids = [], [], [], []
     with torch.no_grad():
         for batch in loader:
-            logits = model(batch["image"].to(device), batch["state"].to(device), batch["progress"].to(device))
-            probabilities.extend(torch.sigmoid(logits).cpu().numpy().tolist())
+            batch_logits = model(
+                batch["image"].to(device),
+                batch["state"].to(device),
+                batch["progress"].to(device),
+            )
+            logits.extend(batch_logits.cpu().numpy().tolist())
             labels.extend(batch["label"].numpy().tolist())
+            progresses.extend(batch["progress"].numpy().tolist())
             episode_ids.extend(batch["episode_id"])
-    frame_metrics = binary_metrics(np.asarray(labels), np.asarray(probabilities))
-    episodes: dict[str, list[tuple[float, float]]] = {}
-    for episode_id, label, probability in zip(episode_ids, labels, probabilities, strict=True):
-        episodes.setdefault(episode_id, []).append((label, probability))
-    episode_labels = np.asarray([values[0][0] for values in episodes.values()])
-    episode_probabilities = np.asarray([np.mean([item[1] for item in values]) for values in episodes.values()])
-    return {
-        "frames": len(labels),
-        "episodes": len(episodes),
-        "frame": frame_metrics,
-        "episode": binary_metrics(episode_labels, episode_probabilities),
-        "constant_prior": binary_metrics(
-            episode_labels, np.full_like(episode_labels, train_prior, dtype=np.float64)
-        ),
-    }
+    return (
+        np.asarray(labels),
+        np.asarray(logits),
+        np.asarray(progresses),
+        episode_ids,
+    )
+
+
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    train_prior: float,
+    temperature: float = 1.0,
+) -> dict[str, Any]:
+    labels, logits, _, episode_ids = predict_outputs(model, loader, device)
+    probabilities = 1.0 / (1.0 + np.exp(-logits / temperature))
+    return summarize_outputs(labels, probabilities, episode_ids, train_prior)
 
 
 def main() -> None:
@@ -206,14 +309,51 @@ def main() -> None:
 
     checkpoint = torch.load(args.output_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"])
+    val_labels, val_logits, _, val_episode_ids = predict_outputs(
+        model, loaders["val"], device
+    )
+    test_labels, test_logits, _, test_episode_ids = predict_outputs(
+        model, loaders["test"], device
+    )
+    # Calibrate using validation logits only; test labels are never used to fit T.
+    temperature = fit_temperature(val_logits, val_labels)
+    raw_test = summarize_outputs(
+        test_labels,
+        1.0 / (1.0 + np.exp(-test_logits)),
+        test_episode_ids,
+        train_prior,
+    )
+    calibrated_test = summarize_outputs(
+        test_labels,
+        1.0 / (1.0 + np.exp(-test_logits / temperature)),
+        test_episode_ids,
+        train_prior,
+    )
+    heuristic_estimates = progress_heuristic(datasets["train"].samples)
+    heuristic_labels, heuristic_probabilities, heuristic_ids = heuristic_outputs(
+        datasets["test"].samples, heuristic_estimates
+    )
     report = {
         "task_id": args.task_id,
         "seed": args.seed,
         "device": str(device),
         "train_prior": train_prior,
         "split_grouping": ["task_id", "init_state_index"],
+        "calibration": {
+            "temperature": temperature,
+            "fit_split": "val",
+            "raw_test": raw_test,
+            "temperature_scaled_test": calibrated_test,
+            "progress_heuristic_test": summarize_outputs(
+                heuristic_labels,
+                heuristic_probabilities,
+                heuristic_ids,
+                train_prior,
+            ),
+            "progress_bin_estimates": heuristic_estimates,
+        },
         "validation": evaluate(model, loaders["val"], device, train_prior),
-        "test": evaluate(model, loaders["test"], device, train_prior),
+        "test": raw_test,
         "history": history,
     }
     (args.output_dir / "metrics.json").write_text(json.dumps(report, indent=2, allow_nan=True) + "\n")
