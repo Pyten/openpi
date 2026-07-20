@@ -8,6 +8,7 @@ import json
 import math
 import pickle
 from collections import Counter
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -214,14 +215,97 @@ def _target_counts(total: int) -> dict[str, int]:
     return counts
 
 
-def _allocate_successes(successes: int, targets: dict[str, int], total: int) -> dict[str, int]:
-    raw = {name: successes * count / total for name, count in targets.items()}
-    allocation = {name: min(math.floor(raw[name]), targets[name]) for name in targets}
-    while sum(allocation.values()) < successes:
-        candidates = [name for name in targets if allocation[name] < targets[name]]
-        name = max(candidates, key=lambda key: (raw[key] - allocation[key], targets[key]))
-        allocation[name] += 1
-    return allocation
+def _group_cost(
+    counts: dict[str, int],
+    successes: dict[str, int],
+    targets: dict[str, int],
+    success_targets: dict[str, float],
+) -> float:
+    cost = 0.0
+    for name in SPLIT_RATIOS:
+        count_scale = max(targets[name], 1)
+        success_scale = max(success_targets[name], 1.0)
+        cost += ((counts[name] - targets[name]) / count_scale) ** 2
+        cost += ((successes[name] - success_targets[name]) / success_scale) ** 2
+        overflow = max(counts[name] - targets[name], 0)
+        cost += 4.0 * (overflow / count_scale) ** 2
+    return cost
+
+
+def _assign_groups(
+    task_records: list[dict[str, Any]], seed: int
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for record in task_records:
+        grouped[record["init_state_index"]].append(record)
+
+    rng = np.random.default_rng(seed)
+    groups = list(grouped.values())
+    group_targets = _target_counts(len(groups))
+    targets = _target_counts(len(task_records))
+    success_rate = sum(record["success"] for record in task_records) / len(task_records)
+    success_targets = {name: targets[name] * success_rate for name in targets}
+
+    best_assignment = None
+    best_cost = float("inf")
+    # Group constraints make a simple class-wise shuffle invalid. Search fixed group
+    # quotas instead, selecting the partition whose episode counts and success rates
+    # best match the source task. The seeded search is deterministic and cheap here.
+    for _ in range(20_000):
+        permutation = list(rng.permutation(groups))
+        cursor = 0
+        candidate = {}
+        for name in SPLIT_RATIOS:
+            count = group_targets[name]
+            candidate[name] = [item for group in permutation[cursor : cursor + count] for item in group]
+            cursor += count
+        counts = {name: len(values) for name, values in candidate.items()}
+        successes = {
+            name: sum(record["success"] for record in values)
+            for name, values in candidate.items()
+        }
+        cost = _group_cost(counts, successes, targets, success_targets)
+        if cost < best_cost:
+            best_cost = cost
+            best_assignment = candidate
+
+    assert best_assignment is not None
+    return best_assignment
+
+
+def validate_splits(
+    splits: dict[str, list[dict[str, Any]]], expected_records: int
+) -> dict[str, Any]:
+    episode_owners: dict[str, str] = {}
+    group_owners: dict[tuple[int, int], str] = {}
+    errors = []
+    for split_name, records in splits.items():
+        for record in records:
+            episode_id = record["episode_id"]
+            previous_split = episode_owners.setdefault(episode_id, split_name)
+            if previous_split != split_name:
+                errors.append(
+                    f"episode {episode_id} appears in {previous_split} and {split_name}"
+                )
+            group = (record["task_id"], record["init_state_index"])
+            previous_split = group_owners.setdefault(group, split_name)
+            if previous_split != split_name:
+                errors.append(
+                    f"init-state group {group} appears in {previous_split} and {split_name}"
+                )
+
+    if len(episode_owners) != expected_records:
+        errors.append(
+            f"split contains {len(episode_owners)} unique episodes, expected {expected_records}"
+        )
+    return {
+        "status": "passed" if not errors else "failed",
+        "errors": errors,
+        "unique_episodes": len(episode_owners),
+        "unique_init_state_groups": len(group_owners),
+        "group_overlap_count": 0 if not errors else sum("init-state group" in e for e in errors),
+        "group_key": ["task_id", "init_state_index"],
+    }
 
 
 def create_splits(
@@ -232,30 +316,17 @@ def create_splits(
     task_ids = sorted({record["task_id"] for record in records})
     for task_id in task_ids:
         task_records = [record for record in records if record["task_id"] == task_id]
-        positive = [record for record in task_records if record["success"]]
-        negative = [record for record in task_records if not record["success"]]
-        rng = np.random.default_rng(seed + task_id)
-        rng.shuffle(positive)
-        rng.shuffle(negative)
-
-        targets = _target_counts(len(task_records))
-        positive_counts = _allocate_successes(len(positive), targets, len(task_records))
-        pos_offset = neg_offset = 0
+        task_splits = _assign_groups(task_records, seed + task_id)
         task_summary = {"task_id": task_id, "splits": {}}
         for name in SPLIT_RATIOS:
-            pos_count = positive_counts[name]
-            neg_count = targets[name] - pos_count
-            selected = (
-                positive[pos_offset : pos_offset + pos_count]
-                + negative[neg_offset : neg_offset + neg_count]
-            )
-            rng.shuffle(selected)
+            selected = task_splits[name]
             splits[name].extend(selected)
-            pos_offset += pos_count
-            neg_offset += neg_count
             task_summary["splits"][name] = {
                 "episodes": len(selected),
                 "successes": sum(record["success"] for record in selected),
+                "init_state_groups": len(
+                    {record["init_state_index"] for record in selected}
+                ),
             }
         summaries.append(task_summary)
 
@@ -281,6 +352,11 @@ def main() -> None:
         raise SystemExit(1)
 
     splits, task_summaries = create_splits(records, args.seed)
+    split_validation = validate_splits(splits, len(records))
+    if split_validation["errors"]:
+        for error in split_validation["errors"]:
+            print(f"ERROR: {error}")
+        raise SystemExit(1)
     for name, split_records in splits.items():
         _json_dump(
             output_dir / f"{name}.json",
@@ -289,6 +365,12 @@ def main() -> None:
     summary = {
         "seed": args.seed,
         "ratios": SPLIT_RATIOS,
+        "validation": split_validation,
+        "storage": {
+            "mode": "task_shard_references",
+            "record_fields": ["source_file", "task_index"],
+            "duplicates_rollout_payloads": False,
+        },
         "splits": {
             name: {
                 "episodes": len(values),
