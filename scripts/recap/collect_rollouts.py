@@ -52,7 +52,10 @@ NUM_WAIT     = protocol.NUM_WAIT_STEPS
 RESIZE       = protocol.RESIZE
 REPLAN_STEPS = protocol.REPLAN_STEPS
 NUM_WORKERS  = 10          # one process per LIBERO-Spatial task
-SEED_BASE    = int(os.environ.get("RECAP_SEED_BASE", "0"))
+COLLECTION_SEED = int(os.environ.get(
+    "RECAP_COLLECTION_SEED", os.environ.get("RECAP_SEED_BASE", "0")
+))
+WRITE_MERGED = os.environ.get("RECAP_WRITE_MERGED", "0") == "1"
 OUTPUT_DIR   = pathlib.Path(os.environ.get(
     "RECAP_OUTPUT_DIR",
     "/mnt/vepfs/pyten/Programs/code/pi0.6/data/rollouts",
@@ -172,11 +175,15 @@ def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
                 img, wrist, state = _prep_obs(obs, RESIZE)
 
                 if not action_plan:
+                    action_step = t - NUM_WAIT
                     element = {
                         "observation/image": img,
                         "observation/wrist_image": wrist,
                         "observation/state": state,
                         "prompt": task_desc,
+                        "_openpi_rng_seed": protocol.action_rng_seed(
+                            seed, ep_idx, action_step
+                        ),
                     }
                     try:
                         result = client.infer(element)
@@ -226,7 +233,7 @@ def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
                 "collection_seed": seed,
                 "init_state_index": state_idx,
                 "policy_id": policy_id,
-                "action_rng_mode": "websocket_server_sequence",
+                "action_rng_mode": "protocol_v1_explicit",
                 "protocol": {
                     "suite": SUITE_NAME,
                     "wait_steps": NUM_WAIT,
@@ -286,7 +293,7 @@ def main():
             num_episodes=NUM_EPISODES,
             output_path=out_path,
             log_path=log_path,
-            seed=SEED_BASE + task_id,
+            seed=COLLECTION_SEED,
             policy_id=POLICY_ID,
         ))
 
@@ -307,26 +314,29 @@ def main():
     elapsed = time.time() - t0
     print(f"\nAll workers done in {elapsed/3600:.2f}h")
 
-    # merge all episode files
-    all_eps = []
+    # Summarize task shards without retaining the full dataset in memory.
+    all_eps = [] if WRITE_MERGED else None
+    total = 0
+    n_succ = 0
     for j in jobs:
         fpath = j["output_path"]
         if fpath.exists():
             with open(fpath, "rb") as f:
                 eps = pickle.load(f)
-            all_eps.extend(eps)
+            total += len(eps)
+            n_succ += sum(1 for episode in eps if episode["success"])
+            if all_eps is not None:
+                all_eps.extend(eps)
             print(f"  task{j['task_id']}: {len(eps)} episodes loaded")
         else:
             print(f"  task{j['task_id']}: NO OUTPUT FILE")
 
-    merged_path = OUTPUT_DIR / "all_episodes.pkl"
-    with open(merged_path, "wb") as f:
-        pickle.dump(all_eps, f)
-
-    total    = len(all_eps)
-    n_succ   = sum(1 for e in all_eps if e["success"])
-    print(f"\nMerged {total} episodes, success rate: {n_succ}/{total} = {n_succ/max(total,1)*100:.1f}%")
-    print(f"Saved to {merged_path}")
+    print(f"\nCollected {total} episodes, success rate: {n_succ}/{total} = {n_succ/max(total,1)*100:.1f}%")
+    if all_eps is not None:
+        merged_path = OUTPUT_DIR / "all_episodes.pkl"
+        with open(merged_path, "wb") as f:
+            pickle.dump(all_eps, f)
+        print(f"Merged compatibility file saved to {merged_path}")
 
     manifest = {
         "policy_id": POLICY_ID,
@@ -338,8 +348,9 @@ def main():
         "num_episodes": total,
         "num_successes": n_succ,
         "success_rate": n_succ / max(total, 1),
-        "seed_base": SEED_BASE,
-        "action_rng_mode": "websocket_server_sequence",
+        "collection_seed": COLLECTION_SEED,
+        "action_rng_mode": "protocol_v1_explicit",
+        "storage_mode": "task_shards_with_merged_copy" if WRITE_MERGED else "task_shards",
         "protocol": {
             "wait_steps": NUM_WAIT,
             "max_steps": MAX_STEPS,
