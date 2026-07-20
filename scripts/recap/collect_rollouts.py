@@ -14,33 +14,53 @@ Phase 1C: 多进程 Rollout 采集
 """
 
 import collections
+import json
 import math
 import multiprocessing as mp
 import os
 import pathlib
 import pickle
+import sys
 import time
 import traceback
+import types
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 
 import numpy as np
+
+# LIBERO imports robosuite's optional numba path, which is incompatible with
+# the NumPy version used by openpi. Rollout collection does not need JIT here.
+if "numba" not in sys.modules:
+    numba_mock = types.ModuleType("numba")
+    numba_mock.jit = lambda *args, **kwargs: (lambda fn: fn)
+    sys.modules["numba"] = numba_mock
+
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 from openpi_client import image_tools, websocket_client_policy as _ws_client
+from openpi.recap import evaluation_protocol as protocol
 
 # ── constants ────────────────────────────────────────────────────────────────
-POLICY_HOST = "127.0.0.1"
-POLICY_PORT = 8000
-SUITE_NAME   = "libero_spatial"
-NUM_EPISODES = 50          # episodes per task (300 for full RECAP; 50 for quick test)
-MAX_STEPS    = 220         # libero_spatial max
-NUM_WAIT     = 10          # stabilisation steps
-RESIZE       = 224         # image resize
-REPLAN_STEPS = 5           # action chunk stride
-NUM_WORKERS  = 10          # parallel processes (one per task)
-OUTPUT_DIR   = pathlib.Path("/mnt/vepfs/pyten/Programs/code/pi0.6/data/rollouts")
-LOG_DIR      = pathlib.Path("/mnt/vepfs/pyten/Programs/code/pi0.6/logs")
+POLICY_HOST = os.environ.get("RECAP_POLICY_HOST", "127.0.0.1")
+POLICY_PORT = int(os.environ.get("RECAP_POLICY_PORT", "8000"))
+POLICY_ID   = os.environ.get("RECAP_POLICY_ID", "unknown")
+SUITE_NAME   = protocol.SUITE_NAME
+NUM_EPISODES = int(os.environ.get("RECAP_NUM_EPISODES", "50"))
+MAX_STEPS    = protocol.MAX_STEPS
+NUM_WAIT     = protocol.NUM_WAIT_STEPS
+RESIZE       = protocol.RESIZE
+REPLAN_STEPS = protocol.REPLAN_STEPS
+NUM_WORKERS  = 10          # one process per LIBERO-Spatial task
+SEED_BASE    = int(os.environ.get("RECAP_SEED_BASE", "0"))
+OUTPUT_DIR   = pathlib.Path(os.environ.get(
+    "RECAP_OUTPUT_DIR",
+    "/mnt/vepfs/pyten/Programs/code/pi0.6/data/rollouts",
+))
+LOG_DIR      = pathlib.Path(os.environ.get(
+    "RECAP_LOG_DIR",
+    "/mnt/vepfs/pyten/Programs/code/pi0.6/logs",
+))
 DUMMY_ACTION = [0.0] * 6 + [-1.0]
 
 
@@ -70,7 +90,7 @@ def _prep_obs(obs, resize):
 # ── per-task worker ───────────────────────────────────────────────────────────
 def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
               init_states, num_episodes: int, output_path: pathlib.Path,
-              log_path: pathlib.Path, seed: int):
+              log_path: pathlib.Path, seed: int, policy_id: str):
     """Each worker runs one LIBERO task, collects num_episodes rollouts."""
 
     os.environ["MUJOCO_GL"] = "osmesa"
@@ -139,6 +159,8 @@ def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
         action_plan = collections.deque()
         t = 0
         done = False
+        reward = 0.0
+        info = {}
 
         while t < MAX_STEPS + NUM_WAIT:
             try:
@@ -176,7 +198,6 @@ def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
                 ep_dones.append(bool(done))
 
                 if done:
-                    successes += 1
                     break
 
                 t += 1
@@ -185,13 +206,16 @@ def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
                 log(f"  ep{ep_idx} t={t}: step error: {e}")
                 break
 
+        success = bool(info.get("success", reward > 0.5))
+        successes += int(success)
+
         if len(ep_actions) > 0:
             episodes.append({
                 "task_id":    task_id,
                 "task_name":  task_name,
                 "prompt":     task_desc,
                 "ep_idx":     ep_idx,
-                "success":    bool(done),
+                "success":    success,
                 "length":     len(ep_actions),
                 "images":     np.stack(ep_obs_imgs),        # (T, H, W, 3) uint8
                 "wrist_imgs": np.stack(ep_wrist_imgs),      # (T, H, W, 3) uint8
@@ -199,10 +223,21 @@ def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
                 "actions":    np.stack(ep_actions),         # (T, 7) float32
                 "rewards":    np.array(ep_rewards),
                 "dones":      np.array(ep_dones),
+                "collection_seed": seed,
+                "init_state_index": state_idx,
+                "policy_id": policy_id,
+                "action_rng_mode": "websocket_server_sequence",
+                "protocol": {
+                    "suite": SUITE_NAME,
+                    "wait_steps": NUM_WAIT,
+                    "max_steps": MAX_STEPS,
+                    "replan_steps": REPLAN_STEPS,
+                    "resize": RESIZE,
+                },
             })
 
         ep_time = time.time() - ep_start
-        log(f"  ep{ep_idx}: success={done} len={len(ep_actions)} t={ep_time:.1f}s  [{successes}/{ep_idx+1}]")
+        log(f"  ep{ep_idx}: success={success} len={len(ep_actions)} t={ep_time:.1f}s  [{successes}/{ep_idx+1}]")
 
     env.close()
     log_f.close()
@@ -251,7 +286,8 @@ def main():
             num_episodes=NUM_EPISODES,
             output_path=out_path,
             log_path=log_path,
-            seed=42 + task_id,
+            seed=SEED_BASE + task_id,
+            policy_id=POLICY_ID,
         ))
 
     print(f"Launching {min(NUM_WORKERS, n_tasks)} parallel workers for {n_tasks} tasks × {NUM_EPISODES} eps each")
@@ -291,6 +327,29 @@ def main():
     n_succ   = sum(1 for e in all_eps if e["success"])
     print(f"\nMerged {total} episodes, success rate: {n_succ}/{total} = {n_succ/max(total,1)*100:.1f}%")
     print(f"Saved to {merged_path}")
+
+    manifest = {
+        "policy_id": POLICY_ID,
+        "policy_host": POLICY_HOST,
+        "policy_port": POLICY_PORT,
+        "suite": SUITE_NAME,
+        "episodes_per_task": NUM_EPISODES,
+        "num_tasks": n_tasks,
+        "num_episodes": total,
+        "num_successes": n_succ,
+        "success_rate": n_succ / max(total, 1),
+        "seed_base": SEED_BASE,
+        "action_rng_mode": "websocket_server_sequence",
+        "protocol": {
+            "wait_steps": NUM_WAIT,
+            "max_steps": MAX_STEPS,
+            "replan_steps": REPLAN_STEPS,
+            "resize": RESIZE,
+        },
+    }
+    manifest_path = OUTPUT_DIR / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    print(f"Manifest saved to {manifest_path}")
 
 
 if __name__ == "__main__":
