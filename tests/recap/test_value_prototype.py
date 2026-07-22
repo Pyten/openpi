@@ -32,7 +32,7 @@ def test_temperature_scaling_is_fit_without_changing_rank_order():
 
 def test_progress_heuristic_uses_episode_level_counts():
     def episode(success: bool):
-        return {"success": success, "actions": np.zeros((4, 1))}
+        return {"success": success, "task_id": 5, "actions": np.zeros((4, 1))}
 
     samples = [
         ("a", episode(True), 0),
@@ -41,4 +41,20 @@ def test_progress_heuristic_uses_episode_level_counts():
         ("b", episode(False), 1),
     ]
     estimates = value.progress_heuristic(samples, bins=2, smoothing=0.0)
-    assert estimates[0] == 0.5
+    assert estimates[5][0] == 0.5
+
+
+def test_multitask_metrics_preserve_per_task_results():
+    labels = np.array([0, 1, 0, 1])
+    probabilities = np.array([0.1, 0.9, 0.2, 0.8])
+    task_ids = np.array([5, 5, 9, 9])
+    report = value.multitask_metrics(
+        labels,
+        probabilities,
+        ["5a", "5b", "9a", "9b"],
+        task_ids,
+        {5: 0.5, 9: 0.5},
+    )
+    assert report["per_task"]["5"]["frame"]["auroc"] == 1.0
+    assert report["per_task"]["9"]["frame"]["auroc"] == 1.0
+    assert report["macro"]["frame"]["auroc"] == 1.0
