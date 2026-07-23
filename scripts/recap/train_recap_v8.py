@@ -141,10 +141,12 @@ def get_norm_stats(train_config):
     norm_file  = assets_dir / "physical-intelligence" / "libero" / "norm_stats.json"
     with open(norm_file) as f:
         d = json.load(f)
-    ns   = d["norm_stats"]["actions"]
-    mean = np.array(ns["mean"])
-    std  = np.array(ns["std"])
-    return mean.astype(np.float32), std.astype(np.float32)
+    actions = d["norm_stats"]["actions"]
+    states = d["norm_stats"]["state"]
+    return (np.asarray(states["mean"], dtype=np.float32),
+            np.asarray(states["std"], dtype=np.float32),
+            np.asarray(actions["mean"], dtype=np.float32),
+            np.asarray(actions["std"], dtype=np.float32))
 
 
 # ── loss function ──────────────────────────────────────────────────────────────
@@ -298,6 +300,10 @@ def main():
     log(f"ActionDeltaNet: state_dim={args.state_dim}, adv_dim={ADV_DIM}, hidden={args.hidden_dim}")
 
     model_action_dim = model_config.action_dim  # 32
+    state_mean, state_std, action_mean, action_std = get_norm_stats(train_config)
+    if state_mean.shape != (args.state_dim,) or action_mean.shape != (7,):
+        raise ValueError(f"Unexpected LIBERO norm stats: state={state_mean.shape}, actions={action_mean.shape}")
+    log("Using normalized state/action space for v8 flow matching")
 
     # Optimizer: only adv_embed + delta_net
     tx = optax.adamw(args.lr, weight_decay=1e-4)
@@ -356,6 +362,9 @@ def main():
                    images, wrist_images, states, actions, adv_labels,
                    tokens, token_mask, rng):
         m       = nnx.merge(model_graphdef, model_params)
+        # Match pi0 inference space; rollout payloads contain raw env values.
+        states = (states - jnp.asarray(state_mean)) / (jnp.asarray(state_std) + 1e-6)
+        actions = (actions - jnp.asarray(action_mean)) / (jnp.asarray(action_std) + 1e-6)
         adv     = nnx.merge(adv_graphdef,   combined_params["adv"])
         delta   = nnx.merge(delta_graphdef, combined_params["delta"])
 
