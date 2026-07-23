@@ -42,16 +42,17 @@ from openpi.models import model as _model
 from openpi.training import config as _config
 from openpi.models.pi0 import make_attn_mask
 from openpi.shared import nnx_utils
+from openpi.recap import evaluation_protocol as protocol
 import einops
 
 ADV_DIM        = 64
 ACTION_HORIZON = 50
 ACTION_DIM     = 32   # model internal dim
 CFG_BETA       = 2.0
-REPLAN_STEPS   = 10
-MAX_STEPS      = 220
-SUITE_NAME     = "libero_spatial"
-RESIZE         = 224
+REPLAN_STEPS   = protocol.REPLAN_STEPS
+MAX_STEPS      = protocol.MAX_STEPS
+SUITE_NAME     = protocol.SUITE_NAME
+RESIZE         = protocol.RESIZE
 
 
 # ── ActionDeltaNet (must match train_recap_v8.py) ─────────────────────────────
@@ -250,7 +251,7 @@ def eval_task(task_id, task_name, task_desc, task_bddl, init_states,
         init_state = init_states[ep_idx % len(init_states)]
         env.set_init_state(init_state)
 
-        for _ in range(10):
+        for _ in range(protocol.NUM_WAIT_STEPS):
             obs, _, _, _ = env.step([0.0] * 6 + [-1.0])
 
         tokens, token_mask = tokenize(task_desc)
@@ -282,7 +283,7 @@ def eval_task(task_id, task_name, task_desc, task_bddl, init_states,
                     tokenized_prompt_mask=jnp.array(token_mask),
                 )
 
-                rng = jax.random.PRNGKey(seed * 10000 + ep_idx * 1000 + step_i)
+                rng = jax.random.PRNGKey(protocol.action_rng_seed(seed, ep_idx, step_i))
                 actions_raw = np.array(infer_fn(observation, rng))  # [1, 50, 32]
                 actions_7d  = actions_raw[0, :, :7]
                 actions_chunk = actions_7d * (action_std + 1e-6) + action_mean
@@ -318,6 +319,13 @@ def main():
     parser.add_argument("--seed",       type=int, default=0)
     args = parser.parse_args()
 
+    print(
+        "Protocol: "
+        f"suite={SUITE_NAME} episodes/task={args.episodes_per_task} seed={args.seed} "
+        f"wait={protocol.NUM_WAIT_STEPS} max_steps={MAX_STEPS} "
+        f"replan={REPLAN_STEPS} flow_steps={protocol.FLOW_STEPS}",
+        flush=True,
+    )
     print(f"JAX devices: {jax.device_count()} x {jax.devices()[0].device_kind}", flush=True)
     jax.config.update("jax_compilation_cache_dir",
                       str(pathlib.Path("~/.cache/jax").expanduser()))

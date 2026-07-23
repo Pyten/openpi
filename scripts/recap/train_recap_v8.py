@@ -51,6 +51,7 @@ os.environ.setdefault("MUJOCO_GL", "osmesa")
 from openpi.models import model as _model
 from openpi.training import config as _config
 from openpi.training import sharding
+from sidecar_rollout_loader import SidecarRolloutDataLoader
 
 ADV_DIM        = 64     # embedding dim (small! not 2048)
 ACTION_HORIZON = 50
@@ -235,7 +236,13 @@ def compute_loss(model, adv_embed, delta_net, rng,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sft-ckpt",      required=True)
-    parser.add_argument("--labeled-data",  required=True)
+    parser.add_argument("--labeled-data", default=None, help="Legacy merged labeled pickle")
+    parser.add_argument("--rollout-dir", type=pathlib.Path)
+    parser.add_argument("--sidecar-dir", type=pathlib.Path)
+    parser.add_argument("--metadata-dir", type=pathlib.Path)
+    parser.add_argument(
+        "--label-variant", choices=("return_only", "mc", "n50"), default="n50"
+    )
     parser.add_argument("--exp-name",      default="recap_policy_v8")
     parser.add_argument("--num-steps",     type=int, default=30000)
     parser.add_argument("--batch-size",    type=int, default=64)
@@ -244,7 +251,16 @@ def main():
     parser.add_argument("--fsdp-devices",  type=int, default=1)
     parser.add_argument("--state-dim",     type=int, default=8)
     parser.add_argument("--hidden-dim",    type=int, default=512)
+    parser.add_argument("--seed",          type=int, default=0)
+    parser.add_argument("--save-interval", type=int, default=SAVE_INTERVAL)
     args = parser.parse_args()
+    sidecar_args = (args.rollout_dir, args.sidecar_dir, args.metadata_dir)
+    if args.labeled_data and any(value is not None for value in sidecar_args):
+        parser.error("Use either --labeled-data or the sidecar directory arguments, not both")
+    if not args.labeled_data and not all(value is not None for value in sidecar_args):
+        parser.error(
+            "Sidecar mode requires --rollout-dir, --sidecar-dir, and --metadata-dir"
+        )
 
     log(f"JAX devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
     log(f"v8: FROZEN backbone + ActionDeltaNet in action space. lr={args.lr}")
@@ -296,7 +312,23 @@ def main():
     adv_graphdef   = nnx.graphdef(adv_embed)
     delta_graphdef = nnx.graphdef(delta_net)
 
-    data_loader = RolloutDataLoader(pathlib.Path(args.labeled_data), args.batch_size)
+    if args.labeled_data:
+        data_loader = RolloutDataLoader(
+            pathlib.Path(args.labeled_data), args.batch_size, seed=args.seed
+        )
+    else:
+        data_loader = SidecarRolloutDataLoader(
+            args.rollout_dir,
+            args.sidecar_dir,
+            args.metadata_dir,
+            args.label_variant,
+            args.batch_size,
+            seed=args.seed,
+        )
+        log(
+            f"Sidecar dataset: variant={args.label_variant} "
+            f"samples={data_loader.num_samples} positive={data_loader.positive_rate:.2%}"
+        )
 
     from openpi.models.tokenizer import PaligemmaTokenizer
     tokenizer = PaligemmaTokenizer(max_len=train_config.model.max_token_len)
@@ -363,7 +395,7 @@ def main():
     ckpt_dir = pathlib.Path(args.ckpt_base_dir).resolve() / "pi0_libero" / args.exp_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    rng = jax.random.PRNGKey(8)
+    rng = jax.random.PRNGKey(args.seed)
     t0  = time.time()
     total_steps = args.num_steps
     log(f"Starting RECAP v8 training, steps=1..{total_steps} ...")
@@ -395,7 +427,7 @@ def main():
                 f"rate={rate:.2f}s/s eta={remain/3600:.2f}h")
             t0 = time.time()
 
-        if step % SAVE_INTERVAL == 0 or step == total_steps:
+        if step % args.save_interval == 0 or step == total_steps:
             import shutil
             step_dir = ckpt_dir / str(step)
             step_dir.mkdir(parents=True, exist_ok=True)
