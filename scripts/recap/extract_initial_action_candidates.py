@@ -37,6 +37,8 @@ def main() -> None:
                     "task_id": task_id,
                     "init_state_index": int(episode["init_state_index"]),
                     "episode_index": int(episode["ep_idx"]),
+                    "candidate_id": int(episode.get("candidate_id", episode["ep_idx"])),
+                    "continuation_id": int(episode.get("continuation_id", 0)),
                     "success": int(bool(episode["success"])),
                     "image": np.asarray(episode["images"][0], dtype=np.uint8),
                     "wrist_image": np.asarray(episode["wrist_imgs"][0], dtype=np.uint8),
@@ -59,6 +61,12 @@ def main() -> None:
     successes = np.asarray([record["success"] for record in records], dtype=np.int8)
     episode_indices = np.asarray(
         [record["episode_index"] for record in records], dtype=np.int16
+    )
+    candidate_ids = np.asarray(
+        [record["candidate_id"] for record in records], dtype=np.int16
+    )
+    continuation_ids = np.asarray(
+        [record["continuation_id"] for record in records], dtype=np.int8
     )
     images = np.stack([record["image"] for record in records])
     wrist_images = np.stack([record["wrist_image"] for record in records])
@@ -85,6 +93,8 @@ def main() -> None:
         task_ids=task_ids,
         init_state_indices=init_state_indices,
         episode_indices=episode_indices,
+        candidate_ids=candidate_ids,
+        continuation_ids=continuation_ids,
         successes=successes,
         images=images,
         wrist_images=wrist_images,
