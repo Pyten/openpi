@@ -52,12 +52,12 @@ def prep_obs(obs):
     return image, wrist, state
 
 
-def held_out_selection(data_path: pathlib.Path, checkpoints: list[pathlib.Path]):
+def held_out_selection(data_path: pathlib.Path, checkpoints: list[pathlib.Path], cv_fold: int, num_folds: int):
     data = dict(np.load(data_path))
     groups = sorted({(int(t), int(s)) for t, s in zip(data["task_ids"], data["init_state_indices"], strict=True)})
     rng = np.random.default_rng(20260720)
     rng.shuffle(groups)
-    test_groups = set(groups[: len(groups) // 5])
+    test_groups = {group for i, group in enumerate(groups) if i % num_folds == cv_fold}
     device = "cuda"
     models = []
     for checkpoint in checkpoints:
@@ -123,10 +123,14 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--continuations", type=int, default=3)
+    parser.add_argument("--continuation-start", type=int, default=0)
+    parser.add_argument("--cv-fold", type=int, default=0)
+    parser.add_argument("--num-folds", type=int, default=5)
+    parser.add_argument("--arms", nargs="+", choices=("selected", "policy0", "random"), default=("selected", "policy0"))
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     args = parser.parse_args()
-    selected = held_out_selection(args.data, args.ranker)
+    selected = held_out_selection(args.data, args.ranker, args.cv_fold, args.num_folds)
     suite = benchmark.get_benchmark_dict()[protocol.SUITE_NAME]()
     task = suite.get_task(9)
     init_path = pathlib.Path(get_libero_path("init_states")) / suite.tasks[9].problem_folder / suite.tasks[9].init_states_file
@@ -140,8 +144,14 @@ def main():
     for state, (chosen_candidate, chosen_action) in selected.items():
         task_id, state_index = state
         random_candidate = int(np.random.default_rng(20260730 + state_index).integers(24))
-        for arm, candidate, action in (("selected", chosen_candidate, chosen_action), ("random", random_candidate, actions[(task_id, state_index, random_candidate)]), ("policy0", 0, actions[(task_id, state_index, 0)])):
-            for continuation in range(args.continuations):
+        options = {
+            "selected": (chosen_candidate, chosen_action),
+            "random": (random_candidate, actions[(task_id, state_index, random_candidate)]),
+            "policy0": (0, actions[(task_id, state_index, 0)]),
+        }
+        for arm in args.arms:
+            candidate, action = options[arm]
+            for continuation in range(args.continuation_start, args.continuation_start + args.continuations):
                 jobs.append((arm, task_id, state_index, candidate, action, continuation))
     jobs = [job for i, job in enumerate(jobs) if i % args.num_shards == args.shard]
     def invoke(job):

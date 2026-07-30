@@ -53,11 +53,16 @@ def pair_list(records, split):
 
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--data',type=Path,required=True); p.add_argument('--output',type=Path,required=True); p.add_argument('--seed',type=int,default=0); p.add_argument('--epochs',type=int,default=100); args=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--data',type=Path,required=True); p.add_argument('--output',type=Path,required=True); p.add_argument('--seed',type=int,default=0); p.add_argument('--epochs',type=int,default=100); p.add_argument('--cv-fold',type=int); p.add_argument('--num-folds',type=int,default=5); args=p.parse_args()
     torch.manual_seed(args.seed); np.random.seed(args.seed); device='cuda'
     data=dict(np.load(args.data)); records, disagreements=candidate_records(data)
     groups=sorted({(row[0],row[1]) for row in records}); split_rng=np.random.default_rng(20260720); split_rng.shuffle(groups)
-    split={group:('test' if i%10<2 else 'val' if i%10<4 else 'train') for i,group in enumerate(groups)}
+    if args.cv_fold is None:
+        split={group:('test' if i%10<2 else 'val' if i%10<4 else 'train') for i,group in enumerate(groups)}
+    else:
+        if not 0 <= args.cv_fold < args.num_folds:
+            raise ValueError('--cv-fold must be in [0, --num-folds)')
+        split={group:('test' if i % args.num_folds == args.cv_fold else 'train') for i,group in enumerate(groups)}
     pairs,by_group=pair_list(records,split)
     if not pairs['train'] or not pairs['test']: raise RuntimeError('insufficient consensus preference pairs')
     model=Ranker().to(device); optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4,weight_decay=1e-4); rng=np.random.default_rng(args.seed)
@@ -75,6 +80,8 @@ def main():
                 pos=np.asarray([x[0] for x in ps]); neg=np.asarray([x[1] for x in ps])
                 report[name]={'pairs':len(ps),'pair_accuracy':float((model(*features(data,pos,device))>model(*features(data,neg,device))).float().mean())}
         for name in ('val','test'):
+            if not pairs[name]:
+                continue
             selected=[]; random=[]
             for group, rows in by_group.items():
                 if split[group] != name: continue
