@@ -52,12 +52,14 @@ def prep_obs(obs):
     return image, wrist, state
 
 
-def held_out_selection(data_path: pathlib.Path, checkpoints: list[pathlib.Path], cv_fold: int, num_folds: int):
+def held_out_selection(data_path: pathlib.Path, checkpoints: list[pathlib.Path], cv_fold: int, num_folds: int, holdout_task: int | None):
     data = dict(np.load(data_path))
     groups = sorted({(int(t), int(s)) for t, s in zip(data["task_ids"], data["init_state_indices"], strict=True)})
     rng = np.random.default_rng(20260720)
     rng.shuffle(groups)
-    test_groups = {group for i, group in enumerate(groups) if i % num_folds == cv_fold}
+    test_groups = ({group for group in groups if group[0] == holdout_task}
+                   if holdout_task is not None
+                   else {group for i, group in enumerate(groups) if i % num_folds == cv_fold})
     device = "cuda"
     models = []
     for checkpoint in checkpoints:
@@ -126,14 +128,22 @@ def main():
     parser.add_argument("--continuation-start", type=int, default=0)
     parser.add_argument("--cv-fold", type=int, default=0)
     parser.add_argument("--num-folds", type=int, default=5)
+    parser.add_argument("--holdout-task", type=int)
+    parser.add_argument("--task-id", type=int)
     parser.add_argument("--arms", nargs="+", choices=("selected", "policy0", "random"), default=("selected", "policy0"))
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     args = parser.parse_args()
-    selected = held_out_selection(args.data, args.ranker, args.cv_fold, args.num_folds)
+    selected = held_out_selection(args.data, args.ranker, args.cv_fold, args.num_folds, args.holdout_task)
     suite = benchmark.get_benchmark_dict()[protocol.SUITE_NAME]()
-    task = suite.get_task(9)
-    init_path = pathlib.Path(get_libero_path("init_states")) / suite.tasks[9].problem_folder / suite.tasks[9].init_states_file
+    task_ids = sorted({task_id for task_id, _ in selected})
+    if args.task_id is not None:
+        task_ids = [args.task_id]
+    if len(task_ids) != 1:
+        raise ValueError("evaluation must select exactly one task; pass --task-id")
+    task_id = task_ids[0]
+    task = suite.get_task(task_id)
+    init_path = pathlib.Path(get_libero_path("init_states")) / suite.tasks[task_id].problem_folder / suite.tasks[task_id].init_states_file
     init_states = torch.load(init_path, weights_only=False)
     raw = dict(np.load(args.data))
     actions = {}
@@ -142,6 +152,8 @@ def main():
     bddl = str(pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file)
     jobs = []
     for state, (chosen_candidate, chosen_action) in selected.items():
+        if state[0] != task_id:
+            continue
         task_id, state_index = state
         random_candidate = int(np.random.default_rng(20260730 + state_index).integers(24))
         options = {
