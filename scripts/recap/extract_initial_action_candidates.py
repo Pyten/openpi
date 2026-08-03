@@ -43,6 +43,9 @@ def main() -> None:
                     "image": np.asarray(episode["images"][0], dtype=np.uint8),
                     "wrist_image": np.asarray(episode["wrist_imgs"][0], dtype=np.uint8),
                     "state": np.asarray(episode["states"][0], dtype=np.float32),
+                    "post_image": np.asarray(episode["images"][min(args.chunk_steps, len(episode["images"]) - 1)], dtype=np.uint8),
+                    "post_wrist_image": np.asarray(episode["wrist_imgs"][min(args.chunk_steps, len(episode["wrist_imgs"]) - 1)], dtype=np.uint8),
+                    "post_state": np.asarray(episode["states"][min(args.chunk_steps, len(episode["states"]) - 1)], dtype=np.float32),
                     "action_chunk": np.asarray(
                         episode["actions"][: args.chunk_steps], dtype=np.float32
                     ),
@@ -71,6 +74,9 @@ def main() -> None:
     images = np.stack([record["image"] for record in records])
     wrist_images = np.stack([record["wrist_image"] for record in records])
     states = np.stack([record["state"] for record in records])
+    post_images = np.stack([record["post_image"] for record in records])
+    post_wrist_images = np.stack([record["post_wrist_image"] for record in records])
+    post_states = np.stack([record["post_state"] for record in records])
     action_chunks = np.stack([record["action_chunk"] for record in records])
 
     group_keys = list(zip(task_ids.tolist(), init_state_indices.tolist(), strict=True))
@@ -99,6 +105,9 @@ def main() -> None:
         images=images,
         wrist_images=wrist_images,
         states=states,
+        post_images=post_images,
+        post_wrist_images=post_wrist_images,
+        post_states=post_states,
         action_chunks=action_chunks,
     )
     manifest = {

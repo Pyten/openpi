@@ -57,6 +57,7 @@ NUM_EPISODES = int(os.environ.get("RECAP_NUM_EPISODES", "50"))
 EPISODE_START = int(os.environ.get("RECAP_EPISODE_START", "0"))
 PILOT_TASK_IDS = {int(x) for x in os.environ.get("RECAP_PILOT_TASK_IDS", "9").split(",")}
 PILOT_INIT_STATES = int(os.environ.get("RECAP_PILOT_INIT_STATES", "10"))
+INIT_STATE_INDICES = [int(x) for x in os.environ.get("RECAP_INIT_STATE_INDICES", "").split(",") if x.strip()]
 PILOT_CANDIDATES = int(os.environ.get("RECAP_PILOT_CANDIDATES", "24"))
 PILOT_CONTINUATIONS = int(os.environ.get("RECAP_PILOT_CONTINUATIONS", "2"))
 MAX_STEPS    = protocol.MAX_STEPS
@@ -159,7 +160,8 @@ def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
         try:
             env.reset()
             # use fixed initial state for reproducibility
-            state_idx = (ep_idx // (PILOT_CANDIDATES * PILOT_CONTINUATIONS)) % PILOT_INIT_STATES
+            state_slot = (ep_idx // (PILOT_CANDIDATES * PILOT_CONTINUATIONS)) % PILOT_INIT_STATES
+            state_idx = INIT_STATE_INDICES[state_slot] if INIT_STATE_INDICES else state_slot
             candidate_id = ep_idx % PILOT_CANDIDATES
             continuation_id = (ep_idx // PILOT_CANDIDATES) % PILOT_CONTINUATIONS
             obs = env.set_init_state(init_states[state_idx])
@@ -241,9 +243,9 @@ def worker_fn(task_id: int, task_name: str, task_desc: str, task_bddl: str,
                 "ep_idx":     ep_idx,
                 "success":    success,
                 "length":     len(ep_actions),
-                "images":     np.stack(ep_obs_imgs[:1]),
-                "wrist_imgs": np.stack(ep_wrist_imgs[:1]),
-                "states":     np.stack(ep_states[:1]),
+                "images":     np.stack(ep_obs_imgs[: REPLAN_STEPS + 1]),
+                "wrist_imgs": np.stack(ep_wrist_imgs[: REPLAN_STEPS + 1]),
+                "states":     np.stack(ep_states[: REPLAN_STEPS + 1]),
                 "actions":    np.stack(ep_actions[:REPLAN_STEPS]),
                 "collection_seed": seed,
                 "init_state_index": state_idx,
