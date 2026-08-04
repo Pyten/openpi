@@ -63,6 +63,8 @@ cover/
 
 # Django stuff:
 *.log
+logs/
+results/
 scripts/recap/*.bak*
 local_settings.py
 db.sqlite3
