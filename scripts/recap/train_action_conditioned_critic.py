@@ -56,7 +56,8 @@ def main():
             for g,rows in by.items():
                 if split[g]!=name: continue
                 idx=np.asarray([r[3] for r in rows]); y=np.asarray([r[4] for r in rows]); score=model(*features(d,idx,device)).cpu().numpy(); selected.append(float(y[score.argmax()])); random.append(float(y.mean()))
-            report[name]['groups']=len(selected); report[name]['top1_success']=float(np.mean(selected)); report[name]['random_success']=float(np.mean(random))
+            if selected:
+                report[name]={'groups':len(selected),'top1_success':float(np.mean(selected)),'random_success':float(np.mean(random))}
     args.output.mkdir(parents=True,exist_ok=True); torch.save({'model':model.state_dict(),'report':report},args.output/'best.pt'); (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report,indent=2))
 
 
