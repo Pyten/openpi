@@ -27,7 +27,7 @@ def features(d, idx, device):
 
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--data',type=Path,required=True); p.add_argument('--output',type=Path,required=True); p.add_argument('--seed',type=int,default=0); p.add_argument('--epochs',type=int,default=120); args=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--data',type=Path,required=True); p.add_argument('--output',type=Path,required=True); p.add_argument('--seed',type=int,default=0); p.add_argument('--epochs',type=int,default=120); p.add_argument('--cv-fold',type=int,default=0); p.add_argument('--num-folds',type=int,default=5); args=p.parse_args()
     torch.manual_seed(args.seed); np.random.seed(args.seed); device='cuda'; d=dict(np.load(args.data)); grouped={}
     for i,key in enumerate(zip(d['task_ids'],d['init_state_indices'],d['candidate_ids'],strict=True)): grouped.setdefault(tuple(map(int,key)),[]).append(i)
     records=[]; disagreements=0
@@ -36,7 +36,7 @@ def main():
         y=d['successes'][ids]
         if y[0]!=y[1]: disagreements+=1; continue
         records.append((task,state,candidate,ids[0],int(y[0])))
-    groups=sorted({(r[0],r[1]) for r in records}); rng=np.random.default_rng(20260804); rng.shuffle(groups); split={g:('test' if i%5<1 else 'val' if i%5<2 else 'train') for i,g in enumerate(groups)}
+    groups=sorted({(r[0],r[1]) for r in records}); rng=np.random.default_rng(20260804); rng.shuffle(groups); split={g:('test' if i%args.num_folds==args.cv_fold else 'train') for i,g in enumerate(groups)}
     pairs={x:[] for x in ('train','val','test')}; by={}
     for r in records: by.setdefault((r[0],r[1]),[]).append(r)
     for g,rows in by.items():
@@ -57,7 +57,7 @@ def main():
                 if split[g]!=name: continue
                 idx=np.asarray([r[3] for r in rows]); y=np.asarray([r[4] for r in rows]); score=model(*features(d,idx,device)).cpu().numpy(); selected.append(float(y[score.argmax()])); random.append(float(y.mean()))
             if selected:
-                report[name]={'groups':len(selected),'top1_success':float(np.mean(selected)),'random_success':float(np.mean(random))}
+                report.setdefault(name,{}).update({'groups':len(selected),'top1_success':float(np.mean(selected)),'random_success':float(np.mean(random))})
     args.output.mkdir(parents=True,exist_ok=True); torch.save({'model':model.state_dict(),'report':report},args.output/'best.pt'); (args.output/'report.json').write_text(json.dumps(report,indent=2)+'\n'); print(json.dumps(report,indent=2))
 
 
